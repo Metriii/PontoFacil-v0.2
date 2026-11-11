@@ -139,6 +139,9 @@ class AnaliseSensiveis:
     suspeitos: tuple[Caixa, ...] = ()
     conflito: bool = False
     motivo: str | None = None
+    # Diagnostico apenas para log: rotulos fixos (regra, tipo de conflito).
+    # Nunca contem texto lido da imagem.
+    detalhe: str | None = None
 
 
 @dataclass(frozen=True)

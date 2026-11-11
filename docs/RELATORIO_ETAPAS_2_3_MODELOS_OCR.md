@@ -149,3 +149,45 @@ as imagens não estão no repositório.
    (não sobe sobre texto desconhecido), por privacidade.
 6. Os limites (6 linhas, 4 colunas, 60 %, 1,5 altura, 4 px) são estimativas
    sem calibração em fotos reais.
+
+---
+
+## 9. Diagnóstico em log (adicionado depois, sem alterar decisões)
+
+Os primeiros lotes reais mostraram que o log só dizia o código da falha, sem o
+modelo nem o motivo. Foi adicionado diagnóstico para separar as hipóteses
+(código antigo rodando, geometria sem confiança, conflito falso ou real).
+**Nenhuma regra de decisão mudou**: a suíte completa se comporta como antes.
+
+Formato das linhas (`logs/`):
+
+```text
+Imagem bloqueada (id=..., modelo=modelo-4): SENSITIVE_FIELD_CONFLICT | <motivo> | regra=localizada conflitos=1 tipos=mascara
+Imagem bloqueada (id=..., modelo=modelo-1): ANCHOR_NOT_FOUND | <motivo> | rotulos=ausentes geometria=poucas_celulas celulas=0
+Imagem bloqueada (id=..., modelo=modelo-2): ANCHOR_NOT_CONFIDENT | <motivo> | geometria=deriva_alta celulas=96 colunas=8 colunas_grade=8 deriva_alturas=1.74
+Imagem bloqueada (id=..., modelo=modelo-2): ANCHOR_NOT_CONFIDENT | <motivo> | geometria=nao_tentada(falha_nao_recuperavel)
+Imagem bloqueada (id=..., modelo=...): TABLE_NOT_DETECTED | <motivo> | caixas_texto=NN
+Imagem aprovada em XX.XXs (id=..., modelo=modelo-1, aviso=ANCHOR_GEOMETRIC, N bytes)
+```
+
+Como ler:
+
+| Campo | Significado |
+|---|---|
+| `geometria=nao_tentada(...)` | a falha da âncora textual não é recuperável por geometria (ambiguidade) |
+| `geometria=nao_aplicavel` | modelo sem geometria (3, 4, 5) |
+| `geometria=poucas_celulas` | o detector não devolveu células suficientes (< 24) |
+| `geometria=grade_curta` | menos de 4 colunas com 6 ou mais linhas empilhadas |
+| `geometria=deriva_alta` | topo das colunas diverge mais de 1,5 altura (inclinação/perspectiva) |
+| `geometria=cobertura_baixa` | a grade cobre menos de 60 % da largura da tabela |
+| `geometria=poucos_dados` | menos de 3 horários/dias dentro da grade |
+| `tipos=mesma_linha\|coluna\|mascara\|mascara_vizinha\|sobra_cabecalho` | por que o campo sensível conflitou |
+| `regra=original\|localizada` | qual regra de conflito foi usada (`localizada` = Modelo 4) |
+| `aviso=ANCHOR_GEOMETRIC` | a imagem aprovada usou a âncora geométrica |
+
+Privacidade: o diagnóstico contém apenas rótulos fixos e números agregados
+(contagens, razões). **Nunca** texto lido da imagem; um teste garante que nome,
+CPF e empresa do cabeçalho não aparecem no log. Todas as mensagens de erro já
+eram texto fixo, contagem de páginas ou nome da classe da exceção.
+
+Testes: +12 (total 450 na suíte; 1 falha pré-existente de caminho Windows).

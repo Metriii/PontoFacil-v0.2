@@ -28,10 +28,18 @@ log = logging.getLogger("pontofacil")
 
 
 class ErroAnon(RuntimeError):
-    def __init__(self, codigo: CodigoFalha, mensagem: str) -> None:
+    def __init__(
+        self,
+        codigo: CodigoFalha,
+        mensagem: str,
+        *,
+        diagnostico: str | None = None,
+    ) -> None:
         super().__init__(mensagem)
         self.codigo = codigo
         self.mensagem = mensagem
+        # Apenas para log: rotulos fixos e metricas agregadas, sem texto lido.
+        self.diagnostico = diagnostico
 
 
 def _anonimizar_sync(
@@ -53,12 +61,17 @@ def _anonimizar_sync(
     try:
         deteccao = detector.detectar(dados, modelo=modelo)
     except detector.ErroDeteccao as exc:
-        raise ErroAnon(exc.codigo, str(exc)) from exc
+        raise ErroAnon(
+            exc.codigo,
+            str(exc),
+            diagnostico=getattr(exc, "diagnostico", None),
+        ) from exc
 
     if deteccao.tabela is None:
         raise ErroAnon(
             CodigoFalha.TABLE_NOT_DETECTED,
             "Nenhuma tabela de ponto detectada.",
+            diagnostico=f"caixas_texto={len(deteccao.caixas_texto)}",
         )
     if deteccao.cabecalho is None:
         raise ErroAnon(
@@ -73,6 +86,7 @@ def _anonimizar_sync(
         raise ErroAnon(
             CodigoFalha.SENSITIVE_FIELD_CONFLICT,
             analise.motivo or "Campo identificavel em conflito com horarios.",
+            diagnostico=analise.detalhe,
         )
     if analise.suspeitos:
         raise ErroAnon(
@@ -186,7 +200,9 @@ async def _processar_uma(
     except ErroAnon as exc:
         logs.warning(
             "Anonimizacao",
-            f"Imagem bloqueada (id={id_opaco}): {exc.codigo.value}",
+            f"Imagem bloqueada (id={id_opaco}, modelo={modelo or '-'}): "
+            f"{exc.codigo.value} | {exc.mensagem}"
+            + (f" | {exc.diagnostico}" if exc.diagnostico else ""),
             lote,
         )
         return ResultadoAnonimizacao.bloqueado(
@@ -229,6 +245,7 @@ async def _processar_uma(
     logs.info(
         "Anonimizacao",
         f"Imagem aprovada em {duracao:.2f}s (id={id_opaco}, "
+        f"modelo={modelo or '-'}, aviso={resultado.aviso_ancora or '-'}, "
         f"{len(resultado.artefato or b'')} bytes)",
         lote,
     )

@@ -245,6 +245,7 @@ def analisar_sensiveis(
     redigir: list[Caixa] = []
     conflitou = False
     motivo: str | None = None
+    tipos_conflito: list[str] = []  # so para o log; nunca guarda texto lido
 
     for caixa in straddling:
         # A sobra de cabecalho pode atravessar a largura da tabela; so bloqueia
@@ -261,6 +262,7 @@ def analisar_sensiveis(
                 continue
             conflitou = True
             motivo = "Sobra de cabecalho encosta em dados da tabela."
+            tipos_conflito.append("sobra_cabecalho")
             continue
         redigir.append(caixa)
 
@@ -278,25 +280,33 @@ def analisar_sensiveis(
             continue
 
         # Campo sensivel: verifica se o conflito com horarios e real.
+        na_linha = any(_mesma_linha(caixa, horario) for horario in horarios)
+        tipo_conflito: str | None
         if modelo in MODELOS_MASCARA_LOCALIZADA:
-            em_conflito = any(
-                _mesma_linha(caixa, horario) for horario in horarios
-            ) or _mascara_atinge_dados(caixa, dados)
+            if na_linha:
+                tipo_conflito = "mesma_linha"
+            elif _mascara_atinge_dados(caixa, dados):
+                tipo_conflito = "mascara"
+            else:
+                tipo_conflito = None
             motivo_conflito = (
                 "Campo identificavel na linha de um horario ou com mascara "
                 "sobre horarios."
             )
         else:
-            em_conflito = any(
-                _mesma_linha(caixa, horario) or _mesma_coluna(caixa, horario)
-                for horario in horarios
-            )
+            if na_linha:
+                tipo_conflito = "mesma_linha"
+            elif any(_mesma_coluna(caixa, horario) for horario in horarios):
+                tipo_conflito = "coluna"
+            else:
+                tipo_conflito = None
             motivo_conflito = (
                 "Campo identificavel compartilha linha/coluna com horarios."
             )
-        if em_conflito and not _caixa_covered(caixa, extras):
+        if tipo_conflito is not None and not _caixa_covered(caixa, extras):
             conflitou = True
             motivo = motivo_conflito
+            tipos_conflito.append(tipo_conflito)
             continue
 
         redigir.append(caixa)
@@ -329,14 +339,24 @@ def analisar_sensiveis(
                 ):
                     conflitou = True
                     motivo = motivo_conflito
+                    tipos_conflito.append("mascara_vizinha")
                     continue
                 redigir.append(vizinha)
+
+    detalhe: str | None = None
+    if tipos_conflito:
+        regra = "localizada" if modelo in MODELOS_MASCARA_LOCALIZADA else "original"
+        detalhe = (
+            f"regra={regra} conflitos={len(tipos_conflito)} "
+            f"tipos={','.join(sorted(set(tipos_conflito)))}"
+        )
 
     return AnaliseSensiveis(
         redigir=tuple(dict.fromkeys(redigir)),
         suspeitos=(),  # Na politica Opcao A, nao ha suspeitos gerados automaticamente
         conflito=conflitou,
         motivo=motivo,
+        detalhe=detalhe,
     )
 
 

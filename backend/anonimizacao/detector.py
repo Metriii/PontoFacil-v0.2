@@ -30,9 +30,17 @@ from .schemas import (
 class ErroDeteccao(RuntimeError):
     """Falha do modelo estrutural, sempre mapeada para um codigo de bloqueio."""
 
-    def __init__(self, codigo: CodigoFalha, mensagem: str) -> None:
+    def __init__(
+        self,
+        codigo: CodigoFalha,
+        mensagem: str,
+        *,
+        diagnostico: str | None = None,
+    ) -> None:
         super().__init__(mensagem)
         self.codigo = codigo
+        # Apenas para log: rotulos fixos e metricas agregadas, sem texto lido.
+        self.diagnostico = diagnostico
 
 
 _modelo: Any = None
@@ -716,35 +724,44 @@ def _resolver_inicio(
             topo = _detectar_inicio_tabela(tabela, caixas_texto)
             if topo is not None:
                 return max(0.0, topo - 4.0), "ANCHOR_FALLBACK"
+            diagnostico = "rotulos=ausentes geometria=nao_aplicavel"
             if modelo == "modelo-1":
-                geometrica = ancoras.ancora_geometrica(
+                avaliacao = ancoras.avaliar_geometria(
                     modelo,
                     tabela=tabela,
                     caixas_texto=caixas_texto,
                     celulas=celulas,
                 )
-                if geometrica is not None:
+                if avaliacao.ancora is not None:
                     return (
-                        max(0.0, geometrica.y),
+                        max(0.0, avaliacao.ancora.y),
                         ancoras.AVISO_ANCORA_GEOMETRICA,
                     )
+                diagnostico = f"rotulos=ausentes {avaliacao.resumo()}"
             raise ErroDeteccao(
                 CodigoFalha.ANCHOR_NOT_FOUND,
                 "Nao foi possivel localizar o inicio da tabela de ponto.",
+                diagnostico=diagnostico,
             ) from exc
+        diagnostico = "geometria=nao_tentada"
         if modelo == "modelo-2" and exc.recuperavel_por_geometria:
-            geometrica = ancoras.ancora_geometrica(
+            avaliacao = ancoras.avaliar_geometria(
                 modelo,
                 tabela=tabela,
                 caixas_texto=caixas_texto,
                 celulas=celulas,
             )
-            if geometrica is not None:
+            if avaliacao.ancora is not None:
                 return (
-                    max(0.0, geometrica.y),
+                    max(0.0, avaliacao.ancora.y),
                     ancoras.AVISO_ANCORA_GEOMETRICA,
                 )
-        raise ErroDeteccao(exc.codigo, exc.mensagem) from exc
+            diagnostico = avaliacao.resumo()
+        elif modelo == "modelo-2":
+            diagnostico = "geometria=nao_tentada(falha_nao_recuperavel)"
+        raise ErroDeteccao(
+            exc.codigo, exc.mensagem, diagnostico=diagnostico
+        ) from exc
 
     if ancora is None:
         return _inicio_generico(tabela, caixas_texto), None

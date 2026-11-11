@@ -619,5 +619,241 @@ class TestModelo4PipelineAnonimizacao(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Diagnostico em log (nao altera nenhuma decisao)
+# ---------------------------------------------------------------------------
+
+
+def _celulas_tabela(grade: list[list[float]]) -> tuple[CelulaTabela, ...]:
+    return tuple(
+        CelulaTabela(caixa=Caixa(c[0], c[1], c[2] - c[0], c[3] - c[1]))
+        for c in grade
+    )
+
+
+def _textos_caixas(
+    textos: list[tuple[str, list[float]]],
+) -> tuple[Caixa, ...]:
+    return tuple(
+        Caixa(c[0], c[1], c[2] - c[0], c[3] - c[1], texto=t)
+        for t, c in textos
+    )
+
+
+class TestDiagnosticoGeometria(unittest.TestCase):
+    def _avaliar(self, modelo, grade, textos):
+        return ancoras.avaliar_geometria(
+            modelo,
+            tabela=Caixa(40, 100, 440, 660),
+            caixas_texto=_textos_caixas(textos),
+            celulas=_celulas_tabela(grade),
+        )
+
+    def test_grade_valida_informa_metricas(self) -> None:
+        resultado = self._avaliar(
+            "modelo-1",
+            _celulas_grade(y0=_Y_GRADE),
+            _horarios_grade(_Y_GRADE),
+        )
+
+        self.assertIsNotNone(resultado.ancora)
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertEqual(resultado.metricas["colunas_grade"], _COLUNAS)
+        self.assertIn("geometria=ok", resultado.resumo())
+
+    def test_motivos_de_rejeicao(self) -> None:
+        horarios = _horarios_grade(_Y_GRADE)
+
+        self.assertEqual(
+            self._avaliar("modelo-1", [], horarios).motivo, "poucas_celulas"
+        )
+        self.assertEqual(
+            self._avaliar(
+                "modelo-1", _celulas_grade(y0=_Y_GRADE, linhas=3), horarios
+            ).motivo,
+            "poucas_celulas",
+        )
+        inclinada = _celulas_grade(
+            y0=_Y_GRADE,
+            inclinacao=(3.0 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL),
+        )
+        resultado = self._avaliar("modelo-1", inclinada, horarios)
+        self.assertEqual(resultado.motivo, "deriva_alta")
+        self.assertGreater(resultado.metricas["deriva_alturas"], 1.5)
+        self.assertEqual(
+            self._avaliar(
+                "modelo-1", _celulas_grade(y0=_Y_GRADE), []
+            ).motivo,
+            "poucos_dados",
+        )
+
+    def test_modelos_sem_geometria_sao_nao_aplicaveis(self) -> None:
+        for modelo in ("modelo-3", "modelo-4", "modelo-5", None):
+            resultado = self._avaliar(
+                modelo,
+                _celulas_grade(y0=_Y_GRADE),
+                _horarios_grade(_Y_GRADE),
+            )
+            self.assertIsNone(resultado.ancora, modelo)
+            self.assertEqual(resultado.motivo, "nao_aplicavel")
+
+    def test_erro_do_detector_carrega_o_diagnostico(self) -> None:
+        dados = _dados_ocr(
+            _ADMIN_CHINES + _horarios_grade(_Y_GRADE), _TABELA, None
+        )
+
+        with self.assertRaises(detector.ErroDeteccao) as modelo1:
+            detector._extrair(dados, 600, 900, modelo="modelo-1")
+        self.assertIn("geometria=poucas_celulas", modelo1.exception.diagnostico)
+
+        with self.assertRaises(detector.ErroDeteccao) as modelo3:
+            detector._extrair(dados, 600, 900, modelo="modelo-3")
+        self.assertIn("nao_aplicavel", modelo3.exception.diagnostico)
+
+    def test_modelo2_nao_recuperavel_informa_que_nao_tentou(self) -> None:
+        textos = [
+            ("Saida", [270, 372, 340, 390]),
+            ("CTPS 000/00", [60, 120, 200, 140]),
+        ]
+        dados = _dados_ocr(textos, _TABELA, _celulas_grade(y0=_Y_GRADE))
+
+        with self.assertRaises(detector.ErroDeteccao) as contexto:
+            detector._extrair(dados, 600, 900, modelo="modelo-2")
+
+        self.assertIn(
+            "falha_nao_recuperavel", contexto.exception.diagnostico
+        )
+
+
+class TestDiagnosticoConflito(unittest.TestCase):
+    def test_tipo_de_conflito_por_regra(self) -> None:
+        falso = _deteccao_falso_conflito()
+
+        original = validacao.analisar_sensiveis(falso)
+        self.assertEqual(
+            original.detalhe, "regra=original conflitos=1 tipos=coluna"
+        )
+
+        sobreposta = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(150, TOPO_TABELA + 60, 100, 60, texto="Empregado: JOAO"),
+            )
+        )
+        localizada = validacao.analisar_sensiveis(
+            sobreposta, modelo="modelo-4"
+        )
+        self.assertEqual(
+            localizada.detalhe, "regra=localizada conflitos=1 tipos=mascara"
+        )
+
+        mesma_linha = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(500, TOPO_TABELA + 100, 150, 18, texto="Empregado: JOAO"),
+            )
+        )
+        self.assertEqual(
+            validacao.analisar_sensiveis(
+                mesma_linha, modelo="modelo-4"
+            ).detalhe,
+            "regra=localizada conflitos=1 tipos=mesma_linha",
+        )
+
+    def test_sem_conflito_nao_tem_detalhe(self) -> None:
+        analise = validacao.analisar_sensiveis(
+            _deteccao_falso_conflito(), modelo="modelo-4"
+        )
+
+        self.assertFalse(analise.conflito)
+        self.assertIsNone(analise.detalhe)
+
+    def test_decisao_nao_muda_com_o_diagnostico(self) -> None:
+        # O detalhe e so informativo: conflito e redigir seguem os mesmos.
+        analise = validacao.analisar_sensiveis(_deteccao_falso_conflito())
+
+        self.assertTrue(analise.conflito)
+        self.assertEqual(analise.redigir, ())
+
+
+class TestLogDeDiagnostico(unittest.IsolatedAsyncioTestCase):
+    async def _processar(self, deteccao, dados: bytes, modelo: str):
+        with patch.object(
+            service.detector,
+            "detectar",
+            lambda _dados, modelo=None: deteccao,
+        ), patch.object(service.logs, "warning") as aviso, patch.object(
+            service.logs, "info"
+        ) as info:
+            resultados = await service.processar_lote(
+                [("folha.png", dados)], lote="lote-teste", modelo=modelo
+            )
+        mensagens = [chamada.args[1] for chamada in aviso.call_args_list]
+        mensagens += [chamada.args[1] for chamada in info.call_args_list]
+        return resultados[0], mensagens
+
+    async def test_bloqueio_registra_modelo_motivo_e_diagnostico(self) -> None:
+        deteccao = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(150, TOPO_TABELA + 60, 100, 60, texto="Empregado: JOAO"),
+            )
+        )
+
+        resultado, mensagens = await self._processar(
+            deteccao, criar_folha_sintetica(), "modelo-4"
+        )
+
+        self.assertEqual(resultado.status, StatusAnonimizacao.BLOCKED)
+        linha = next(m for m in mensagens if "bloqueada" in m)
+        self.assertIn("modelo=modelo-4", linha)
+        self.assertIn("SENSITIVE_FIELD_CONFLICT", linha)
+        self.assertIn("regra=localizada", linha)
+        self.assertIn("tipos=mascara", linha)
+
+    async def test_log_nunca_contem_texto_lido_da_imagem(self) -> None:
+        deteccao = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(150, TOPO_TABELA + 60, 100, 60, texto="Empregado: JOAO"),
+            )
+        )
+
+        _resultado, mensagens = await self._processar(
+            deteccao, criar_folha_sintetica(), "modelo-4"
+        )
+
+        registro = "\n".join(mensagens)
+        for proibido in ("JOAO", "SILVA", "123.456", "EMPRESA"):
+            self.assertNotIn(proibido, registro)
+
+    async def test_aprovada_registra_modelo_e_aviso(self) -> None:
+        deteccao = _deteccao_falso_conflito()
+        dados = _imagem_com_marcas(
+            [Caixa(160, TOPO_TABELA + 100, 90, 18)],
+            [Caixa(150, TOPO_TABELA + 30, 200, 18)],
+        )
+
+        resultado, mensagens = await self._processar(
+            deteccao, dados, "modelo-4"
+        )
+
+        self.assertEqual(resultado.status, StatusAnonimizacao.APPROVED)
+        linha = next(m for m in mensagens if "aprovada" in m)
+        self.assertIn("modelo=modelo-4", linha)
+        self.assertIn("aviso=-", linha)
+
+    async def test_sem_tabela_registra_contagem_de_caixas(self) -> None:
+        from dataclasses import replace
+
+        sem_tabela = replace(
+            _deteccao_falso_conflito(), tabela=None, cabecalho=None
+        )
+
+        _resultado, mensagens = await self._processar(
+            sem_tabela, criar_folha_sintetica(), "modelo-1"
+        )
+
+        linha = next(m for m in mensagens if "bloqueada" in m)
+        self.assertIn("TABLE_NOT_DETECTED", linha)
+        self.assertIn("caixas_texto=", linha)
+
+
 if __name__ == "__main__":
     unittest.main()

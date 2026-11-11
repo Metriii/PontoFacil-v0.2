@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .schemas import Caixa, CelulaTabela, CodigoFalha
@@ -603,58 +603,85 @@ def _estender_por_rotulos(
     return atual
 
 
-def ancora_geometrica(
-    modelo: str,
+@dataclass(frozen=True)
+class ResultadoGeometria:
+    """Resultado da avaliacao da grade, com as metricas que levaram a ele.
+
+    ``motivo`` e ``metricas`` servem ao log de diagnostico: sao rotulos fixos e
+    numeros agregados, nunca texto lido da imagem.
+    """
+
+    ancora: Ancora | None
+    motivo: str
+    metricas: dict[str, float | int] = field(default_factory=dict)
+
+    def resumo(self) -> str:
+        partes = [f"geometria={self.motivo}"]
+        for nome, valor in self.metricas.items():
+            partes.append(
+                f"{nome}={valor:.2f}"
+                if isinstance(valor, float)
+                else f"{nome}={valor}"
+            )
+        return " ".join(partes)
+
+
+def avaliar_geometria(
+    modelo: str | None,
     *,
     tabela: Caixa,
     caixas_texto: tuple[Caixa, ...],
     celulas: tuple[CelulaTabela, ...] = (),
-) -> Ancora | None:
+) -> ResultadoGeometria:
     """Topo da grade de registros, deduzido da estrutura das celulas.
 
     Usada somente quando a ancora textual do modelo falha por falta de texto
-    (Modelo 1 sem quinzena; Modelo 2 com cabecalho incompleto). Devolve
-    ``None`` quando a estrutura nao tem confianca suficiente; o chamador
-    deve entao bloquear a imagem, nunca recortar de forma arbitraria.
+    (Modelo 1 sem quinzena; Modelo 2 com cabecalho incompleto). Sem confianca
+    suficiente, ``ancora`` e ``None`` e o chamador deve bloquear a imagem,
+    nunca recortar de forma arbitraria.
 
-    Os Modelos 3, 4 e 5 retornam sempre ``None``: este fallback nao se aplica
-    a eles.
+    Os Modelos 3, 4 e 5 nunca recebem ancora geometrica.
     """
     if modelo == "modelo-1":
         origem = ORIGEM_GEOMETRIA_MODELO1
     elif modelo == "modelo-2":
         origem = ORIGEM_GEOMETRIA_MODELO2
     else:
-        return None
+        return ResultadoGeometria(None, "nao_aplicavel")
 
     caixas = [
         celula.caixa
         for celula in celulas
         if celula.caixa.largura > 0 and celula.caixa.altura > 0
     ]
+    metricas: dict[str, float | int] = {"celulas": len(caixas)}
     if len(caixas) < _MIN_LINHAS_GRADE * _MIN_COLUNAS_GRADE:
-        return None
+        return ResultadoGeometria(None, "poucas_celulas", metricas)
 
     altura = _mediana([caixa.altura for caixa in caixas])
     larguras = sorted(caixa.largura for caixa in caixas)
     folga = max(10.0, 0.6 * larguras[len(larguras) // 4])
 
-    corridas = [
-        _maior_corrida(coluna, altura)
-        for coluna in _agrupar_colunas(caixas, folga)
-    ]
+    colunas = _agrupar_colunas(caixas, folga)
+    corridas = [_maior_corrida(coluna, altura) for coluna in colunas]
     grade = [corrida for corrida in corridas if len(corrida) >= _MIN_LINHAS_GRADE]
+    metricas["colunas"] = len(colunas)
+    metricas["colunas_grade"] = len(grade)
     if len(grade) < _MIN_COLUNAS_GRADE:
-        return None
+        return ResultadoGeometria(None, "grade_curta", metricas)
 
     topos = [min(caixa.y for caixa in corrida) for corrida in grade]
-    if max(topos) - min(topos) > _DERIVA_MAX_GRADE * altura:
-        return None
+    deriva = (max(topos) - min(topos)) / altura
+    metricas["deriva_alturas"] = round(deriva, 2)
+    if deriva > _DERIVA_MAX_GRADE:
+        return ResultadoGeometria(None, "deriva_alta", metricas)
 
     esquerda = min(caixa.x for corrida in grade for caixa in corrida)
     direita = max(caixa.x2 for corrida in grade for caixa in corrida)
-    if (direita - esquerda) < _COBERTURA_MIN_GRADE * max(1.0, tabela.largura):
-        return None
+    cobertura = (direita - esquerda) / max(1.0, tabela.largura)
+    metricas["cobertura"] = round(cobertura, 2)
+    if cobertura < _COBERTURA_MIN_GRADE:
+        return ResultadoGeometria(None, "cobertura_baixa", metricas)
 
     topo = min(topos)
     dados = [
@@ -667,10 +694,26 @@ def ancora_geometrica(
         and caixa.x2 > tabela.x
         and caixa.x < tabela.x2
     ]
+    metricas["dados"] = len(dados)
     if len(dados) < _MIN_DADOS_GRADE:
-        return None
+        return ResultadoGeometria(None, "poucos_dados", metricas)
 
     if modelo == "modelo-2":
         topo = _estender_por_rotulos(topo, tabela, caixas_texto, altura)
 
-    return Ancora(y=float(max(tabela.y, topo)), origem=origem)
+    return ResultadoGeometria(
+        Ancora(y=float(max(tabela.y, topo)), origem=origem), "ok", metricas
+    )
+
+
+def ancora_geometrica(
+    modelo: str | None,
+    *,
+    tabela: Caixa,
+    caixas_texto: tuple[Caixa, ...],
+    celulas: tuple[CelulaTabela, ...] = (),
+) -> Ancora | None:
+    """Atalho de ``avaliar_geometria`` que devolve so a ancora (ou ``None``)."""
+    return avaliar_geometria(
+        modelo, tabela=tabela, caixas_texto=caixas_texto, celulas=celulas
+    ).ancora
