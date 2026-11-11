@@ -66,7 +66,9 @@ def _anonimizar_sync(
             "Nao foi possivel separar o cabecalho da tabela.",
         )
 
-    analise = validacao.analisar_sensiveis(deteccao, extras=regioes_extras)
+    analise = validacao.analisar_sensiveis(
+        deteccao, extras=regioes_extras, modelo=modelo
+    )
     if analise.conflito:
         raise ErroAnon(
             CodigoFalha.SENSITIVE_FIELD_CONFLICT,

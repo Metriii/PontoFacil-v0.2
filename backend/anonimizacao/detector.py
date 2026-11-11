@@ -687,6 +687,14 @@ def _resolver_inicio(
     Os Modelos 1/2/3 usam a ancora especifica do modelo. Se a ancora do
     Modelo 1/3 nao existir (``ANCHOR_NOT_FOUND``), o fallback de rotulos e
     aceito com o aviso ``ANCHOR_FALLBACK``; qualquer outra falha bloqueia.
+
+    Alternativa estrutural (``ANCHOR_GEOMETRIC``), exclusiva de cada modelo:
+
+    - Modelo 1 (variacao sem quinzena): ultimo recurso, depois do fallback de
+      rotulos que ja existia.
+    - Modelo 2: somente quando a ancora textual falha por falta de texto
+      (``recuperavel_por_geometria``); ambiguidades continuam bloqueando.
+    - Modelo 3 (verde): nenhuma alternativa nova; comportamento preservado.
     """
     if modelo not in _MODELOS_COM_ANCORA:
         return _inicio_generico(tabela, caixas_texto), None
@@ -706,12 +714,36 @@ def _resolver_inicio(
             and exc.codigo is CodigoFalha.ANCHOR_NOT_FOUND
         ):
             topo = _detectar_inicio_tabela(tabela, caixas_texto)
-            if topo is None:
-                raise ErroDeteccao(
-                    CodigoFalha.ANCHOR_NOT_FOUND,
-                    "Nao foi possivel localizar o inicio da tabela de ponto.",
-                ) from exc
-            return max(0.0, topo - 4.0), "ANCHOR_FALLBACK"
+            if topo is not None:
+                return max(0.0, topo - 4.0), "ANCHOR_FALLBACK"
+            if modelo == "modelo-1":
+                geometrica = ancoras.ancora_geometrica(
+                    modelo,
+                    tabela=tabela,
+                    caixas_texto=caixas_texto,
+                    celulas=celulas,
+                )
+                if geometrica is not None:
+                    return (
+                        max(0.0, geometrica.y),
+                        ancoras.AVISO_ANCORA_GEOMETRICA,
+                    )
+            raise ErroDeteccao(
+                CodigoFalha.ANCHOR_NOT_FOUND,
+                "Nao foi possivel localizar o inicio da tabela de ponto.",
+            ) from exc
+        if modelo == "modelo-2" and exc.recuperavel_por_geometria:
+            geometrica = ancoras.ancora_geometrica(
+                modelo,
+                tabela=tabela,
+                caixas_texto=caixas_texto,
+                celulas=celulas,
+            )
+            if geometrica is not None:
+                return (
+                    max(0.0, geometrica.y),
+                    ancoras.AVISO_ANCORA_GEOMETRICA,
+                )
         raise ErroDeteccao(exc.codigo, exc.mensagem) from exc
 
     if ancora is None:

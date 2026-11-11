@@ -33,12 +33,25 @@ class Ancora:
 
 
 class ErroAncora(RuntimeError):
-    """Ancora ausente ou sem confianca suficiente."""
+    """Ancora ausente ou sem confianca suficiente.
 
-    def __init__(self, codigo: CodigoFalha, mensagem: str) -> None:
+    ``recuperavel_por_geometria`` indica que a falha veio da leitura do texto
+    (rotulo ausente ou cabecalho incompleto) e que a estrutura da grade pode
+    ser consultada como alternativa. Falhas de ambiguidade ou de conteudo
+    sobre os registros nunca sao recuperaveis: continuam bloqueando.
+    """
+
+    def __init__(
+        self,
+        codigo: CodigoFalha,
+        mensagem: str,
+        *,
+        recuperavel_por_geometria: bool = False,
+    ) -> None:
         super().__init__(mensagem)
         self.codigo = codigo
         self.mensagem = mensagem
+        self.recuperavel_por_geometria = recuperavel_por_geometria
 
 
 # Aceita 1a/1o/1o/1/2a... e variacoes de OCR. Depois de ``_sem_acento``
@@ -238,6 +251,7 @@ def ancora_modelo2(
         raise ErroAncora(
             CodigoFalha.ANCHOR_NOT_FOUND,
             "Ancora de saida nao encontrada no cabecalho.",
+            recuperavel_por_geometria=True,
         )
 
     alturas = sorted(caixa.altura for caixa in saidas)
@@ -276,6 +290,7 @@ def ancora_modelo2(
         raise ErroAncora(
             CodigoFalha.ANCHOR_NOT_CONFIDENT,
             "Saida encontrada, mas o cabecalho da tabela esta incompleto.",
+            recuperavel_por_geometria=True,
         )
 
     topo = min(caixa.y for caixa in rotulos)
@@ -502,3 +517,160 @@ def _fracao_faixa(
         if chroma >= 18 and brilho <= 220:
             coloridos += 1
     return coloridos / total if total else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Ancora geometrica (alternativa estrutural, apenas Modelo 1 e Modelo 2)
+# ---------------------------------------------------------------------------
+
+AVISO_ANCORA_GEOMETRICA = "ANCHOR_GEOMETRIC"
+ORIGEM_GEOMETRIA_MODELO1 = "GEOMETRIA_TABELA_MODELO1"
+ORIGEM_GEOMETRIA_MODELO2 = "GEOMETRIA_GRADE_MODELO2"
+
+# Todos os limites abaixo sao relativos (altura/largura medianas das celulas
+# ou largura da tabela); nenhum depende da resolucao da imagem.
+_MIN_LINHAS_GRADE = 6
+_MIN_COLUNAS_GRADE = 4
+_MIN_DADOS_GRADE = 3
+_COBERTURA_MIN_GRADE = 0.6
+_DERIVA_MAX_GRADE = 1.5  # em alturas de celula; acima disso a grade e incerta
+
+
+def _mediana(valores: list[float]) -> float:
+    ordenados = sorted(valores)
+    return ordenados[len(ordenados) // 2]
+
+
+def _agrupar_colunas(caixas: list[Caixa], folga: float) -> list[list[Caixa]]:
+    """Agrupa celulas pelo centro horizontal (tolera inclinacao leve)."""
+    colunas: list[list[Caixa]] = []
+    ultimo = 0.0
+    for caixa in sorted(caixas, key=lambda item: item.x + item.largura / 2):
+        centro = caixa.x + caixa.largura / 2
+        if colunas and centro - ultimo <= folga:
+            colunas[-1].append(caixa)
+        else:
+            colunas.append([caixa])
+        ultimo = centro
+    return colunas
+
+
+def _maior_corrida(coluna: list[Caixa], altura: float) -> list[Caixa]:
+    """Maior sequencia de celulas empilhadas sem vao, de cima para baixo."""
+    ordenada = sorted(coluna, key=lambda item: item.y)
+    corridas: list[list[Caixa]] = [[ordenada[0]]]
+    for caixa in ordenada[1:]:
+        anterior = corridas[-1][-1]
+        vao = caixa.y - anterior.y2
+        if -0.5 * altura <= vao <= 0.5 * altura:
+            corridas[-1].append(caixa)
+        else:
+            corridas.append([caixa])
+    return max(corridas, key=len)
+
+
+def _estender_por_rotulos(
+    topo: float,
+    tabela: Caixa,
+    caixas_texto: tuple[Caixa, ...],
+    altura: float,
+) -> float:
+    """Sobe o topo apenas sobre faixas formadas so por rotulos de coluna.
+
+    Preserva ``Dia``/``Entrada``/``Saida``/``Intervalo``/``Hora Extra``/
+    ``Assinatura`` quando a grade comeca nos dados. Qualquer faixa com texto
+    que nao seja rotulo impresso interrompe a subida.
+    """
+    atual = topo
+    limite = topo - 3.5 * altura
+    for _ in range(3):
+        faixa = [
+            caixa
+            for caixa in caixas_texto
+            if caixa.texto
+            and caixa.x2 > tabela.x
+            and caixa.x < tabela.x2
+            and caixa.y2 <= atual + 2.0
+            and caixa.y >= limite
+            and (caixa.y + caixa.altura / 2) >= atual - 1.5 * altura
+        ]
+        if not faixa or not all(_rotulos_modelo2(c.texto) for c in faixa):
+            break
+        novo = min(caixa.y for caixa in faixa)
+        if novo >= atual:
+            break
+        atual = novo
+    return atual
+
+
+def ancora_geometrica(
+    modelo: str,
+    *,
+    tabela: Caixa,
+    caixas_texto: tuple[Caixa, ...],
+    celulas: tuple[CelulaTabela, ...] = (),
+) -> Ancora | None:
+    """Topo da grade de registros, deduzido da estrutura das celulas.
+
+    Usada somente quando a ancora textual do modelo falha por falta de texto
+    (Modelo 1 sem quinzena; Modelo 2 com cabecalho incompleto). Devolve
+    ``None`` quando a estrutura nao tem confianca suficiente; o chamador
+    deve entao bloquear a imagem, nunca recortar de forma arbitraria.
+
+    Os Modelos 3, 4 e 5 retornam sempre ``None``: este fallback nao se aplica
+    a eles.
+    """
+    if modelo == "modelo-1":
+        origem = ORIGEM_GEOMETRIA_MODELO1
+    elif modelo == "modelo-2":
+        origem = ORIGEM_GEOMETRIA_MODELO2
+    else:
+        return None
+
+    caixas = [
+        celula.caixa
+        for celula in celulas
+        if celula.caixa.largura > 0 and celula.caixa.altura > 0
+    ]
+    if len(caixas) < _MIN_LINHAS_GRADE * _MIN_COLUNAS_GRADE:
+        return None
+
+    altura = _mediana([caixa.altura for caixa in caixas])
+    larguras = sorted(caixa.largura for caixa in caixas)
+    folga = max(10.0, 0.6 * larguras[len(larguras) // 4])
+
+    corridas = [
+        _maior_corrida(coluna, altura)
+        for coluna in _agrupar_colunas(caixas, folga)
+    ]
+    grade = [corrida for corrida in corridas if len(corrida) >= _MIN_LINHAS_GRADE]
+    if len(grade) < _MIN_COLUNAS_GRADE:
+        return None
+
+    topos = [min(caixa.y for caixa in corrida) for corrida in grade]
+    if max(topos) - min(topos) > _DERIVA_MAX_GRADE * altura:
+        return None
+
+    esquerda = min(caixa.x for corrida in grade for caixa in corrida)
+    direita = max(caixa.x2 for corrida in grade for caixa in corrida)
+    if (direita - esquerda) < _COBERTURA_MIN_GRADE * max(1.0, tabela.largura):
+        return None
+
+    topo = min(topos)
+    dados = [
+        caixa
+        for caixa in caixas_texto
+        if caixa.texto
+        and _eh_dado(caixa.texto)
+        and caixa.y >= topo - 2.0
+        and caixa.y2 <= tabela.y2 + 2.0
+        and caixa.x2 > tabela.x
+        and caixa.x < tabela.x2
+    ]
+    if len(dados) < _MIN_DADOS_GRADE:
+        return None
+
+    if modelo == "modelo-2":
+        topo = _estender_por_rotulos(topo, tabela, caixas_texto, altura)
+
+    return Ancora(y=float(max(tabela.y, topo)), origem=origem)

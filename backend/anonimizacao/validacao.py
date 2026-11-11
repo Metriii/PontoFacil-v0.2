@@ -134,6 +134,32 @@ def _mesma_coluna(a: Caixa, b: Caixa) -> bool:
     return not (a.x2 <= b.x or b.x2 <= a.x)
 
 
+# Modelos em que o campo sensivel e ocultado por mascara localizada: o conflito
+# so existe quando a mascara de fato atinge um horario/dia ou o campo esta na
+# mesma linha de um horario. Nos demais modelos vale a regra original, que
+# tambem bloqueia por sobreposicao de coluna.
+MODELOS_MASCARA_LOCALIZADA = frozenset({"modelo-4"})
+
+# ``recorte.redigir_caixas`` pinta ``padding=2`` alem da caixa; mais 2 px de
+# folga para imprecisao da caixa do OCR.
+_MARGEM_MASCARA_PX = 4.0
+
+
+def _mascara_atinge_dados(caixa: Caixa, dados: list[Caixa]) -> bool:
+    """True quando a mascara de ``caixa`` cobriria algum horario/dia.
+
+    Uma caixa que ja e horario/dia (texto misto, como ``ASSINATURA 08:00``)
+    esta em ``dados`` e intersecta a si mesma: nunca e mascarada.
+    """
+    mascara = Caixa(
+        x=caixa.x - _MARGEM_MASCARA_PX,
+        y=caixa.y - _MARGEM_MASCARA_PX,
+        largura=caixa.largura + 2 * _MARGEM_MASCARA_PX,
+        altura=caixa.altura + 2 * _MARGEM_MASCARA_PX,
+    )
+    return any(mascara.intersecta(dado) for dado in dados)
+
+
 def _chave_caixa(caixa: Caixa) -> tuple[float, float, float, float]:
     """Identidade geometrica usada para reconhecer caixas ja redigidas."""
     return (
@@ -161,12 +187,20 @@ def analisar_sensiveis(
     deteccao: DeteccaoEstrutural,
     *,
     extras: tuple[tuple[float, float, float, float], ...] = (),
+    modelo: str | None = None,
 ) -> AnaliseSensiveis:
     """Decide o que redigir e o que bloqueia a folha.
 
     Politica (Opcao A): texto acima do limite do cabecalho e redigido (ocultado).
     Textos abaixo do limite sao preservados como dado de ponto.
     Se ha conflito com horarios, bloqueia a folha.
+
+    ``modelo`` seleciona a regra de conflito para campos sensiveis dentro da
+    tabela. Em ``MODELOS_MASCARA_LOCALIZADA`` (Modelo 4) o conflito e geometrico
+    e local: mesma linha de um horario, ou mascara que atingiria um
+    horario/dia. Sobreposicao apenas de coluna deixa de bloquear, porque a
+    mascara cobre so a caixa do campo. Sem ``modelo`` (ou em outros modelos)
+    a regra original e mantida.
 
     ``extras`` sao regioes informadas pelo usuario (coordenadas da imagem
     original) que devem ser ocultadas adicionalmente. Elas podem cobrir um
@@ -243,13 +277,26 @@ def analisar_sensiveis(
             # Caixa abaixo do limite e preservada (dado de ponto) - nao faz nada
             continue
 
-        # Campo sensivel: verifica se divide linha/coluna com horarios.
-        if any(
-            _mesma_linha(caixa, horario) or _mesma_coluna(caixa, horario)
-            for horario in horarios
-        ) and not _caixa_covered(caixa, extras):
+        # Campo sensivel: verifica se o conflito com horarios e real.
+        if modelo in MODELOS_MASCARA_LOCALIZADA:
+            em_conflito = any(
+                _mesma_linha(caixa, horario) for horario in horarios
+            ) or _mascara_atinge_dados(caixa, dados)
+            motivo_conflito = (
+                "Campo identificavel na linha de um horario ou com mascara "
+                "sobre horarios."
+            )
+        else:
+            em_conflito = any(
+                _mesma_linha(caixa, horario) or _mesma_coluna(caixa, horario)
+                for horario in horarios
+            )
+            motivo_conflito = (
+                "Campo identificavel compartilha linha/coluna com horarios."
+            )
+        if em_conflito and not _caixa_covered(caixa, extras):
             conflitou = True
-            motivo = "Campo identificavel compartilha linha/coluna com horarios."
+            motivo = motivo_conflito
             continue
 
         redigir.append(caixa)
@@ -275,6 +322,14 @@ def analisar_sensiveis(
                 if vizinha.x >= primeiro:
                     continue
             if classificar_texto(vizinha.texto) != "permitido":
+                if (
+                    modelo in MODELOS_MASCARA_LOCALIZADA
+                    and _mascara_atinge_dados(vizinha, dados)
+                    and not _caixa_covered(vizinha, extras)
+                ):
+                    conflitou = True
+                    motivo = motivo_conflito
+                    continue
                 redigir.append(vizinha)
 
     return AnaliseSensiveis(
