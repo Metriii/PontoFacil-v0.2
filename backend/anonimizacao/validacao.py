@@ -134,11 +134,12 @@ def _mesma_coluna(a: Caixa, b: Caixa) -> bool:
     return not (a.x2 <= b.x or b.x2 <= a.x)
 
 
+# Modelos 1, 2 e 4 (o Modelo 3 segue a regra original).
 # Modelos em que o campo sensivel e ocultado por mascara localizada: o conflito
 # so existe quando a mascara de fato atinge um horario/dia ou o campo esta na
 # mesma linha de um horario. Nos demais modelos vale a regra original, que
 # tambem bloqueia por sobreposicao de coluna.
-MODELOS_MASCARA_LOCALIZADA = frozenset({"modelo-4"})
+MODELOS_MASCARA_LOCALIZADA = frozenset({"modelo-1", "modelo-2", "modelo-4"})
 
 # ``recorte.redigir_caixas`` pinta ``padding=2`` alem da caixa; mais 2 px de
 # folga para imprecisao da caixa do OCR.

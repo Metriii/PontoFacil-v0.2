@@ -191,3 +191,18 @@ CPF e empresa do cabeçalho não aparecem no log. Todas as mensagens de erro já
 eram texto fixo, contagem de páginas ou nome da classe da exceção.
 
 Testes: +12 (total 450 na suíte; 1 falha pré-existente de caminho Windows).
+
+## 10. Ajustes após os logs reais (lotes de 11/11/2026)
+
+Os logs com diagnóstico mostraram três causas distintas nos lotes reais:
+
+| Log | Causa | Ajuste |
+| --- | --- | --- |
+| Modelo 2, `SENSITIVE_FIELD_CONFLICT regra=original tipos=coluna` | Falso conflito: rótulo sensível na mesma coluna de um horário, sem estar na linha dele nem tocar nenhuma caixa de hora/dia | `MODELOS_MASCARA_LOCALIZADA` passa a incluir `modelo-1` e `modelo-2` (Modelo 3 segue a regra original) |
+| Modelo 1, `ANCHOR_NOT_FOUND geometria=grade_curta celulas=140 colunas=3 colunas_grade=0` | Colunas fundidas pelo agrupamento (comparação com a última célula) e/ou foto torta | Agrupamento compara com o centro médio da coluna; `_melhor_grade` testa ângulos de -6° a +6° e três folgas e escolhe o que cobre mais células em colunas de grade (empate: menor ângulo, ou seja, foto reta nunca é girada) |
+| Modelo 1, `TABLE_NOT_DETECTED caixas_texto=62` | Detector não reconhece a tabela (antes das âncoras) | Sem alteração; fica para o pré-processamento (PD-03) |
+
+- A âncora devolvida continua em coordenadas da imagem original (topo mínimo das células da grade).
+- O diagnóstico `geometria=...` agora inclui `altura_cel`, `larg_q25`, `angulo` e `folga`.
+- Correção da hipótese anterior: "FERIADO" é classificado como permitido; o conflito `mesma_linha` do cartão da Alisson vem de outro texto (provavelmente "Total de Desconto" ou "Assinatura do empregado"). O novo log dirá qual tipo restou.
+- Testes: `TestGeometriaTolerante` e `TestMascaraLocalizadaModelos1E2` (11 novos); o teste de regra original agora vale para os modelos 3 e 5 e `None`.

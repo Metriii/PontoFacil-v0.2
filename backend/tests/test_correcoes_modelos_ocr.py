@@ -386,10 +386,10 @@ class TestModelo3Preservado(unittest.TestCase):
 
         self.assertEqual(deteccao.aviso_ancora, "ANCHOR_FALLBACK")
 
-    def test_vd_regra_de_conflito_original_vale_fora_do_modelo4(self) -> None:
+    def test_vd_regra_de_conflito_original_vale_fora_dos_modelos_localizados(self) -> None:
         deteccao = _deteccao_falso_conflito()
 
-        for modelo in (None, "modelo-1", "modelo-2", "modelo-3", "modelo-5"):
+        for modelo in (None, "modelo-3", "modelo-5"):
             analise = validacao.analisar_sensiveis(deteccao, modelo=modelo)
             self.assertTrue(analise.conflito, modelo)
 
@@ -857,3 +857,136 @@ class TestLogDeDiagnostico(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Grade girada (foto torta) e colunas de larguras diferentes
+# ---------------------------------------------------------------------------
+
+
+def _grade_girada(graus: float, *, y0: float = _Y_GRADE, linhas: int = _LINHAS):
+    """Celulas da grade regular giradas em torno do seu centro."""
+    import math
+
+    base = _celulas_grade(y0=y0, linhas=linhas)
+    cx = _X0 + _COLUNAS * _LARGURA_CEL / 2
+    cy = y0 + linhas * _ALTURA_CEL / 2
+    rad = math.radians(graus)
+    girada = []
+    for x1, y1, x2, y2 in base:
+        mx, my = (x1 + x2) / 2 - cx, (y1 + y2) / 2 - cy
+        nx = cx + mx * math.cos(rad) - my * math.sin(rad)
+        ny = cy + mx * math.sin(rad) + my * math.cos(rad)
+        meia_l, meia_a = (x2 - x1) / 2, (y2 - y1) / 2
+        girada.append([nx - meia_l, ny - meia_a, nx + meia_l, ny + meia_a])
+    return girada
+
+
+class TestGeometriaTolerante(unittest.TestCase):
+    def _avaliar(self, grade, modelo="modelo-1", tabela=None):
+        return ancoras.avaliar_geometria(
+            modelo,
+            tabela=tabela or Caixa(40, 100, 440, 660),
+            caixas_texto=_textos_caixas(_horarios_grade(_Y_GRADE)),
+            celulas=_celulas_tabela(grade),
+        )
+
+    def test_grade_reta_nao_e_girada(self) -> None:
+        resultado = self._avaliar(_celulas_grade(y0=_Y_GRADE))
+
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertEqual(resultado.metricas["angulo"], 0)
+
+    def test_foto_torta_com_linhas_inclinadas_e_reconhecida(self) -> None:
+        # Antes: colunas desalinhadas pela rotacao viravam grade_curta.
+        for graus in (-4, -2, 2, 4):
+            resultado = self._avaliar(_grade_girada(graus))
+            self.assertEqual(resultado.motivo, "ok", graus)
+            self.assertEqual(resultado.metricas["colunas_grade"], _COLUNAS)
+
+    def test_grade_alta_e_torta_precisa_do_giro(self) -> None:
+        # 30 linhas girando 4 graus: o desvio horizontal passa da folga e,
+        # sem girar, as colunas se misturam.
+        resultado = self._avaliar(_grade_girada(4, linhas=30), tabela=Caixa(40, 100, 440, 1500))
+
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertEqual(resultado.metricas["colunas_grade"], _COLUNAS)
+        self.assertNotEqual(resultado.metricas["angulo"], 0)
+
+    def test_ancora_geometrica_fica_em_coordenadas_originais(self) -> None:
+        grade = _grade_girada(3)
+        topo_original = min(celula[1] for celula in grade)
+
+        resultado = self._avaliar(grade)
+
+        assert resultado.ancora is not None
+        self.assertAlmostEqual(resultado.ancora.y, topo_original, places=3)
+
+    def test_coluna_estreita_de_dia_nao_quebra_a_grade(self) -> None:
+        grade = _celulas_grade(y0=_Y_GRADE)
+        for linha in range(_LINHAS):
+            y = _Y_GRADE + linha * _ALTURA_CEL
+            grade.append([_X0 - 40, y, _X0 - 10, y + _ALTURA_CEL])
+        resultado = self._avaliar(grade)
+
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertEqual(resultado.metricas["colunas_grade"], _COLUNAS + 1)
+
+    def test_modelo2_tambem_usa_a_grade_girada(self) -> None:
+        resultado = self._avaliar(_grade_girada(3), modelo="modelo-2")
+
+        self.assertEqual(resultado.motivo, "ok")
+
+    def test_modelo3_continua_sem_geometria(self) -> None:
+        resultado = self._avaliar(_grade_girada(3), modelo="modelo-3")
+
+        self.assertIsNone(resultado.ancora)
+        self.assertEqual(resultado.motivo, "nao_aplicavel")
+
+
+# ---------------------------------------------------------------------------
+# Mascara localizada nos Modelos 1 e 2
+# ---------------------------------------------------------------------------
+
+
+class TestMascaraLocalizadaModelos1E2(unittest.TestCase):
+    def test_falso_conflito_de_coluna_e_redigido_nos_modelos_1_e_2(self) -> None:
+        for modelo in ("modelo-1", "modelo-2"):
+            analise = validacao.analisar_sensiveis(
+                _deteccao_falso_conflito(), modelo=modelo
+            )
+            self.assertFalse(analise.conflito, modelo)
+            self.assertEqual(
+                [caixa.texto for caixa in analise.redigir],
+                ["LOCAL DO TRABALHO"],
+                modelo,
+            )
+
+    def test_mesma_linha_continua_bloqueando(self) -> None:
+        deteccao = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(500, TOPO_TABELA + 100, 150, 18, texto="Empregado: JOAO"),
+            )
+        )
+        for modelo in ("modelo-1", "modelo-2"):
+            analise = validacao.analisar_sensiveis(deteccao, modelo=modelo)
+            self.assertTrue(analise.conflito, modelo)
+            self.assertIn("mesma_linha", analise.detalhe or "")
+
+    def test_mascara_sobre_horario_continua_bloqueando(self) -> None:
+        deteccao = deteccao_sintetica(
+            caixas_tabela=(
+                Caixa(150, TOPO_TABELA + 60, 100, 60, texto="Empregado: JOAO"),
+            )
+        )
+        for modelo in ("modelo-1", "modelo-2"):
+            analise = validacao.analisar_sensiveis(deteccao, modelo=modelo)
+            self.assertTrue(analise.conflito, modelo)
+
+    def test_modelo3_segue_a_regra_original(self) -> None:
+        analise = validacao.analisar_sensiveis(
+            _deteccao_falso_conflito(), modelo="modelo-3"
+        )
+
+        self.assertTrue(analise.conflito)
+        self.assertIn("regra=original", analise.detalhe or "")

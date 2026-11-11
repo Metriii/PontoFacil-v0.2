@@ -16,6 +16,7 @@ Regras:
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -542,16 +543,22 @@ def _mediana(valores: list[float]) -> float:
 
 
 def _agrupar_colunas(caixas: list[Caixa], folga: float) -> list[list[Caixa]]:
-    """Agrupa celulas pelo centro horizontal (tolera inclinacao leve)."""
+    """Agrupa celulas pelo centro horizontal.
+
+    Cada celula entra na coluna cujo centro medio esta a ate ``folga`` dela. A
+    comparacao e com a media da coluna (e nao com a ultima celula), para que
+    celulas de larguras diferentes nao encadeiem colunas vizinhas em uma so.
+    """
     colunas: list[list[Caixa]] = []
-    ultimo = 0.0
+    somas: list[float] = []
     for caixa in sorted(caixas, key=lambda item: item.x + item.largura / 2):
         centro = caixa.x + caixa.largura / 2
-        if colunas and centro - ultimo <= folga:
+        if colunas and abs(centro - somas[-1] / len(colunas[-1])) <= folga:
             colunas[-1].append(caixa)
+            somas[-1] += centro
         else:
             colunas.append([caixa])
-        ultimo = centro
+            somas.append(centro)
     return colunas
 
 
@@ -567,6 +574,63 @@ def _maior_corrida(coluna: list[Caixa], altura: float) -> list[Caixa]:
         else:
             corridas.append([caixa])
     return max(corridas, key=len)
+
+
+_ANGULOS_GRADE = (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6)  # graus
+_FATORES_FOLGA = (0.6, 0.4, 0.8)
+
+
+def _girar(caixas: list[Caixa], graus: float) -> tuple[list[Caixa], dict[int, Caixa]]:
+    """Gira os centros das celulas em torno do centro do conjunto.
+
+    O tamanho de cada celula e mantido; so a posicao muda. Devolve tambem o
+    mapa de volta para a celula original (por ``id``).
+    """
+    if not graus:
+        return list(caixas), {id(caixa): caixa for caixa in caixas}
+    rad = math.radians(graus)
+    cos, sen = math.cos(rad), math.sin(rad)
+    cx = sum(c.x + c.largura / 2 for c in caixas) / len(caixas)
+    cy = sum(c.y + c.altura / 2 for c in caixas) / len(caixas)
+    giradas: list[Caixa] = []
+    mapa: dict[int, Caixa] = {}
+    for caixa in caixas:
+        dx = caixa.x + caixa.largura / 2 - cx
+        dy = caixa.y + caixa.altura / 2 - cy
+        nx = cx + dx * cos - dy * sen
+        ny = cy + dx * sen + dy * cos
+        nova = Caixa(
+            x=nx - caixa.largura / 2,
+            y=ny - caixa.altura / 2,
+            largura=caixa.largura,
+            altura=caixa.altura,
+        )
+        giradas.append(nova)
+        mapa[id(nova)] = caixa
+    return giradas, mapa
+
+
+def _melhor_grade(caixas: list[Caixa], altura: float, base: float):
+    """Escolhe a inclinacao e a folga que cobrem mais celulas em colunas de grade.
+
+    Empata sempre a favor do menor angulo, e depois da folga mais estreita
+    (ordem de ``_FATORES_FOLGA``), para que uma foto reta nunca seja girada.
+    """
+    melhor = None
+    placar = (-1, 0)  # (celulas na grade, -|angulo|)
+    for graus in _ANGULOS_GRADE:
+        giradas, mapa = _girar(caixas, graus)
+        for fator in _FATORES_FOLGA:
+            folga = max(10.0, fator * base)
+            colunas = _agrupar_colunas(giradas, folga)
+            corridas = [_maior_corrida(coluna, altura) for coluna in colunas]
+            grade = [c for c in corridas if len(c) >= _MIN_LINHAS_GRADE]
+            # Celulas cobertas pelas corridas: coluna fragmentada cobre menos.
+            valor = (sum(len(c) for c in grade), -abs(graus))
+            if valor > placar:
+                placar = valor
+                melhor = (colunas, grade, graus, folga, mapa)
+    return melhor
 
 
 def _estender_por_rotulos(
@@ -660,16 +724,21 @@ def avaliar_geometria(
 
     altura = _mediana([caixa.altura for caixa in caixas])
     larguras = sorted(caixa.largura for caixa in caixas)
-    folga = max(10.0, 0.6 * larguras[len(larguras) // 4])
+    base = larguras[len(larguras) // 4]
+    metricas["altura_cel"] = round(altura, 1)
+    metricas["larg_q25"] = round(base, 1)
 
-    colunas = _agrupar_colunas(caixas, folga)
-    corridas = [_maior_corrida(coluna, altura) for coluna in colunas]
-    grade = [corrida for corrida in corridas if len(corrida) >= _MIN_LINHAS_GRADE]
+    melhor = _melhor_grade(caixas, altura, base)
+    colunas, grade, graus, folga, mapa = melhor
     metricas["colunas"] = len(colunas)
     metricas["colunas_grade"] = len(grade)
+    metricas["angulo"] = graus
+    metricas["folga"] = round(folga, 1)
     if len(grade) < _MIN_COLUNAS_GRADE:
         return ResultadoGeometria(None, "grade_curta", metricas)
 
+    # A grade esta em coordenadas giradas; o topo do recorte volta ao original.
+    originais = [mapa[id(caixa)] for corrida in grade for caixa in corrida]
     topos = [min(caixa.y for caixa in corrida) for corrida in grade]
     deriva = (max(topos) - min(topos)) / altura
     metricas["deriva_alturas"] = round(deriva, 2)
@@ -683,7 +752,7 @@ def avaliar_geometria(
     if cobertura < _COBERTURA_MIN_GRADE:
         return ResultadoGeometria(None, "cobertura_baixa", metricas)
 
-    topo = min(topos)
+    topo = min(caixa.y for caixa in originais)
     dados = [
         caixa
         for caixa in caixas_texto
