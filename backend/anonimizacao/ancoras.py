@@ -521,6 +521,219 @@ def _fracao_faixa(
 
 
 # ---------------------------------------------------------------------------
+# Ancora da faixa do mes (apenas Modelo 1, variacao chinesa sem quinzena)
+# ---------------------------------------------------------------------------
+
+AVISO_ANCORA_FAIXA_MES = "ANCHOR_MONTH_BAND"
+ORIGEM_FAIXA_MES_MODELO1 = "FAIXA_MES_MODELO1"
+
+# Rotulos IMPRESSOS da faixa do mes: "年" e "月份". O OCR costuma devolver a
+# faixa como uma unica caixa ("年月份"); aceita tambem "年", "月" e "月份".
+# Nunca depende do mes escrito a mao.
+_MARCO_MES_RE = re.compile(r"年月份?|月份?|年")
+# Contexto que confirma o cartao chines: titulo 考勤表 ou rotulos 上班/下班.
+_CONTEXTO_CHINES_RE = re.compile(r"考勤|勤表|[上下]班")
+_TITULO_CHINES_RE = re.compile(r"考勤|勤表")
+# Primeira linha do cabecalho das colunas e rotulos de apoio.
+_CABECALHO_LINHA1 = ("上午", "下午", "加班")
+_CABECALHO_TOKENS = ("上午", "下午", "加班", "上班", "下班", "日期")
+_MIN_TOKENS_CABECALHO = 2
+_MOTIVOS_FAIXA_MES_BLOQUEIAM = frozenset({"ambigua", "limite_incerto"})
+
+
+def _compacto(texto: str | None) -> str:
+    """Texto sem espacos e normalizado (NFKC), para casar caracteres CJK."""
+    if not texto:
+        return ""
+    return "".join(unicodedata.normalize("NFKC", texto).split())
+
+
+@dataclass(frozen=True)
+class ResultadoFaixaMes:
+    """Resultado da ancora da faixa do mes, com rotulos fixos para o log.
+
+    ``motivo``: ``ok``, ``nao_aplicavel`` (modelo diferente do Modelo 1),
+    ``sem_contexto`` (nao e o cartao chines), ``nao_encontrada``,
+    ``sem_cabecalho`` (a ancora nao vale; o chamador segue para o proximo
+    fallback), ``ambigua`` ou ``limite_incerto`` (o chamador deve bloquear).
+    Nunca guarda texto lido da imagem.
+    """
+
+    ancora: Ancora | None
+    motivo: str
+    metricas: dict[str, float | int] = field(default_factory=dict)
+
+    @property
+    def bloqueia(self) -> bool:
+        return self.motivo in _MOTIVOS_FAIXA_MES_BLOQUEIAM
+
+    def resumo(self) -> str:
+        partes = [f"faixa_mes={self.motivo}"]
+        for nome, valor in self.metricas.items():
+            partes.append(
+                f"{nome}={valor:.2f}"
+                if isinstance(valor, float)
+                else f"{nome}={valor}"
+            )
+        return " ".join(partes)
+
+
+def _altura_referencia(
+    celulas: tuple[CelulaTabela, ...], fallback: float
+) -> float:
+    alturas = [c.caixa.altura for c in celulas if c.caixa.altura > 0]
+    return _mediana(alturas) if alturas else fallback
+
+
+def avaliar_faixa_mes(
+    modelo: str | None,
+    *,
+    tabela: Caixa,
+    caixas_texto: tuple[Caixa, ...],
+    celulas: tuple[CelulaTabela, ...] = (),
+    linhas: tuple[float, ...] = (),
+) -> ResultadoFaixaMes:
+    """Limite do recorte logo abaixo da faixa impressa 年/月份 (Modelo 1).
+
+    A faixa fica entre o titulo 考勤表 e o cabecalho das colunas (日期 / 上午
+    下午 加班 / 上班 下班). O limite e a base da faixa mais uma margem pequena
+    (ou a linha horizontal logo abaixo dela) e precisa ficar ACIMA do centro dos
+    rotulos 上午/下午/加班: se nao couber os dois, bloqueia. A faixa serve de
+    ancora mesmo em branco; so os rotulos impressos importam.
+
+    Sem 年/月份, sem contexto chines ou sem cabecalho/dados abaixo, a ancora
+    nao vale e o chamador segue para o proximo fallback. Mais de uma faixa,
+    rotulos fora da regiao da tabela ou limite que cortaria o cabecalho sao
+    ambiguos e bloqueiam. Modelos 2, 3, 4 e 5 nunca usam esta ancora.
+    """
+    if modelo != "modelo-1":
+        return ResultadoFaixaMes(None, "nao_aplicavel")
+
+    textos = [
+        (caixa, _compacto(caixa.texto))
+        for caixa in caixas_texto
+        if caixa.texto and caixa.largura > 0 and caixa.altura > 0
+    ]
+    if not any(_CONTEXTO_CHINES_RE.search(t) for _c, t in textos):
+        return ResultadoFaixaMes(None, "sem_contexto")
+
+    def _centro(caixa: Caixa) -> float:
+        return caixa.y + caixa.altura / 2
+
+    def _no_eixo_da_tabela(caixa: Caixa) -> bool:
+        sobreposicao = min(caixa.x2, tabela.x2) - max(caixa.x, tabela.x)
+        return sobreposicao > 0 and sobreposicao / max(1.0, caixa.largura) >= 0.5
+
+    titulos = [c for c, t in textos if _TITULO_CHINES_RE.search(t)]
+    centro_titulo = max((_centro(c) for c in titulos), default=None)
+
+    def _abaixo_do_titulo(caixa: Caixa) -> bool:
+        return centro_titulo is None or _centro(caixa) > centro_titulo
+
+    linha1 = [
+        c
+        for c, t in textos
+        if any(token in t for token in _CABECALHO_LINHA1)
+        and _no_eixo_da_tabela(c)
+        and _abaixo_do_titulo(c)
+    ]
+    if not linha1:
+        linha1 = [
+            c
+            for c, t in textos
+            if ("上班" in t or "下班" in t)
+            and _no_eixo_da_tabela(c)
+            and _abaixo_do_titulo(c)
+        ]
+    if not linha1:
+        # Sem rotulo de mes nem cabecalho, nao ha o que ancorar; com a faixa
+        # presente mas sem cabecalho abaixo, a estrutura nao confere.
+        tem_marco = any(_MARCO_MES_RE.fullmatch(t) for _c, t in textos)
+        return ResultadoFaixaMes(
+            None, "sem_cabecalho" if tem_marco else "nao_encontrada"
+        )
+    centro_cab = min(_centro(c) for c in linha1)
+    topo_cab = min(c.y for c in linha1)
+    altura_cab = _mediana([c.altura for c in linha1])
+
+    explicitos = [c for c, t in textos if _MARCO_MES_RE.fullmatch(t)]
+    na_regiao = [
+        c
+        for c in explicitos
+        if _no_eixo_da_tabela(c)
+        and _abaixo_do_titulo(c)
+        and _centro(c) < centro_cab
+    ]
+    metricas: dict[str, float | int] = {"marcos": len(na_regiao)}
+    if len(na_regiao) != len(explicitos):
+        # Rotulo de mes fora da regiao da tabela: ambiguo.
+        metricas["marcos_fora"] = len(explicitos) - len(na_regiao)
+        return ResultadoFaixaMes(None, "ambigua", metricas)
+
+    marcos = na_regiao
+    if not marcos and centro_titulo is not None:
+        # O OCR pode ler os rotulos impressos de forma errada: aceita caixas
+        # curtas com ideograma entre o titulo e o topo do cabecalho.
+        marcos = [
+            c
+            for c, t in textos
+            if 1 <= len(t) <= 4
+            and any("一" <= ch <= "鿿" for ch in t)
+            and not _CONTEXTO_CHINES_RE.search(t)
+            and _no_eixo_da_tabela(c)
+            and centro_titulo < _centro(c) < topo_cab
+        ]
+        metricas["marcos"] = len(marcos)
+    if not marcos:
+        return ResultadoFaixaMes(None, "nao_encontrada", metricas)
+
+    altura_marco = _mediana([c.altura for c in marcos])
+    grupos = _agrupar_por_centro(marcos, max(20.0, 0.8 * altura_marco))
+    metricas["faixas"] = len(grupos)
+    if len(grupos) > 1:
+        return ResultadoFaixaMes(None, "ambigua", metricas)
+
+    base = max(c.y2 for c in marcos)
+    limite = base + max(2.0, 0.05 * altura_marco)
+    # Linha horizontal logo abaixo da base da faixa, quando existir.
+    abaixo = [
+        linha
+        for linha in linhas
+        if base < linha <= base + 0.5 * altura_marco and linha < centro_cab
+    ]
+    if abaixo:
+        limite = min(abaixo) + 1.0
+    limite = max(limite, tabela.y)
+
+    altura_celula = _altura_referencia(celulas, altura_cab)
+    metricas["dist_cabecalho_alturas"] = round(
+        (centro_cab - limite) / max(1.0, altura_celula), 2
+    )
+    if limite >= centro_cab:
+        # Nao cabe entre a base da faixa e o centro de 上午/下午: bloquear.
+        return ResultadoFaixaMes(None, "limite_incerto", metricas)
+
+    tokens = {
+        token
+        for c, t in textos
+        if _centro(c) >= limite and _no_eixo_da_tabela(c)
+        for token in _CABECALHO_TOKENS
+        if token in t
+    }
+    metricas["rotulos_cabecalho"] = len(tokens)
+    if len(tokens) < _MIN_TOKENS_CABECALHO or not _tem_dados_abaixo(
+        tabela, caixas_texto, limite
+    ):
+        return ResultadoFaixaMes(None, "sem_cabecalho", metricas)
+
+    return ResultadoFaixaMes(
+        Ancora(y=float(limite), origem=ORIGEM_FAIXA_MES_MODELO1),
+        "ok",
+        metricas,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Ancora geometrica (alternativa estrutural, apenas Modelo 1 e Modelo 2)
 # ---------------------------------------------------------------------------
 
@@ -535,6 +748,9 @@ _MIN_COLUNAS_GRADE = 4
 _MIN_DADOS_GRADE = 3
 _COBERTURA_MIN_GRADE = 0.6
 _DERIVA_MAX_GRADE = 1.5  # em alturas de celula; acima disso a grade e incerta
+# Modelo 1 (cartao chines): cabecalhos mesclados fazem as colunas comecarem em
+# alturas diferentes mesmo com a foto reta (observado 1.87 e 1.96 com angulo 0).
+_DERIVA_MAX_GRADE_MODELO1 = 2.5
 
 
 def _mediana(valores: list[float]) -> float:
@@ -742,7 +958,10 @@ def avaliar_geometria(
     topos = [min(caixa.y for caixa in corrida) for corrida in grade]
     deriva = (max(topos) - min(topos)) / altura
     metricas["deriva_alturas"] = round(deriva, 2)
-    if deriva > _DERIVA_MAX_GRADE:
+    limite_deriva = (
+        _DERIVA_MAX_GRADE_MODELO1 if modelo == "modelo-1" else _DERIVA_MAX_GRADE
+    )
+    if deriva > limite_deriva:
         return ResultadoGeometria(None, "deriva_alta", metricas)
 
     esquerda = min(caixa.x for corrida in grade for caixa in corrida)

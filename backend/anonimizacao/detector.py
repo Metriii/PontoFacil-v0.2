@@ -696,6 +696,9 @@ def _resolver_inicio(
     Modelo 1/3 nao existir (``ANCHOR_NOT_FOUND``), o fallback de rotulos e
     aceito com o aviso ``ANCHOR_FALLBACK``; qualquer outra falha bloqueia.
 
+    Ordem do Modelo 1: quinzena -> faixa do mes 年/月份 (``ANCHOR_MONTH_BAND``,
+    so cartao chines sem quinzena) -> fallback de rotulos -> geometria.
+
     Alternativa estrutural (``ANCHOR_GEOMETRIC``), exclusiva de cada modelo:
 
     - Modelo 1 (variacao sem quinzena): ultimo recurso, depois do fallback de
@@ -721,6 +724,29 @@ def _resolver_inicio(
             modelo in {"modelo-1", "modelo-3"}
             and exc.codigo is CodigoFalha.ANCHOR_NOT_FOUND
         ):
+            # Modelo 1 sem quinzena: primeiro a faixa impressa 年/月份 (cartao
+            # chines); so depois os rotulos e a geometria. Modelo 3 nao usa.
+            faixa_diag = ""
+            if modelo == "modelo-1":
+                faixa = ancoras.avaliar_faixa_mes(
+                    modelo,
+                    tabela=tabela,
+                    caixas_texto=caixas_texto,
+                    celulas=celulas,
+                    linhas=linhas,
+                )
+                if faixa.bloqueia:
+                    raise ErroDeteccao(
+                        CodigoFalha.ANCHOR_NOT_CONFIDENT,
+                        "Faixa do mes ambigua ou limite incerto.",
+                        diagnostico=faixa.resumo(),
+                    ) from exc
+                if faixa.ancora is not None:
+                    return (
+                        max(0.0, faixa.ancora.y),
+                        ancoras.AVISO_ANCORA_FAIXA_MES,
+                    )
+                faixa_diag = f" {faixa.resumo()}"
             topo = _detectar_inicio_tabela(tabela, caixas_texto)
             if topo is not None:
                 return max(0.0, topo - 4.0), "ANCHOR_FALLBACK"
@@ -737,7 +763,9 @@ def _resolver_inicio(
                         max(0.0, avaliacao.ancora.y),
                         ancoras.AVISO_ANCORA_GEOMETRICA,
                     )
-                diagnostico = f"rotulos=ausentes {avaliacao.resumo()}"
+                diagnostico = (
+                    f"rotulos=ausentes{faixa_diag} {avaliacao.resumo()}"
+                )
             raise ErroDeteccao(
                 CodigoFalha.ANCHOR_NOT_FOUND,
                 "Nao foi possivel localizar o inicio da tabela de ponto.",
@@ -757,6 +785,11 @@ def _resolver_inicio(
                     ancoras.AVISO_ANCORA_GEOMETRICA,
                 )
             diagnostico = avaliacao.resumo()
+            # Ultimo recurso, o mesmo do Modelo 1: rotulos de coluna.
+            topo = _detectar_inicio_tabela(tabela, caixas_texto)
+            if topo is not None:
+                return max(0.0, topo - 4.0), "ANCHOR_FALLBACK"
+            diagnostico += " rotulos=ausentes"
         elif modelo == "modelo-2":
             diagnostico = "geometria=nao_tentada(falha_nao_recuperavel)"
         raise ErroDeteccao(
@@ -766,6 +799,109 @@ def _resolver_inicio(
     if ancora is None:
         return _inicio_generico(tabela, caixas_texto), None
     return max(0.0, ancora.y), None
+
+
+# Modelo 5 (REGISTRO DE PONTO, caderno): em foto com perspectiva o modelo de
+# layout nao devolve ``table``. A regiao da tabela e entao derivada dos rotulos
+# impressos do cabecalho (ENTRADA / SAIDA / ASSINATURA / HORAS) e das linhas de
+# registro. O corte fica logo abaixo da faixa do titulo, que carrega o nome
+# manuscrito do funcionario; tudo acima dele e descartado. O mesmo corte e usado
+# quando o layout acha a tabela mas o caminho generico nao acha o inicio.
+_AVISO_LAYOUT_ROTULOS = "LAYOUT_LABELS"
+# Leituras tortas comuns do OCR em foto escura: S lido como B/R/5, O como 0,
+# I como 1/L (ex.: BAIDA, ARBINATURA, ABBINATURA, HORAB).
+_ROTULOS_M5 = (
+    ("entrada", re.compile(r"^e\s*n\s*t\s*r\s*a\s*d\s*a")),
+    ("saida", re.compile(r"^[sb5r]\s*a\s*[i1l]\s*d\s*a\b")),
+    ("assinatura", re.compile(r"^a[sbr5]{2}[i1l]natura")),
+    ("horas", re.compile(r"^h[o0]ra[sbr5]\b")),
+    ("dia", re.compile(r"^d[i1l]a\b")),
+)
+_TITULO_M5_RE = re.compile(r"registro\s+de\s+ponto")
+
+
+def rotulo_modelo5(texto: str | None) -> str | None:
+    """Rotulo impresso canonico do Modelo 5, tolerando leituras tortas."""
+    if not texto:
+        return None
+    normalizado = _sem_acento(texto).strip()
+    for nome, padrao in _ROTULOS_M5:
+        if padrao.match(normalizado):
+            return nome
+    return None
+
+
+def _tabela_modelo5_por_rotulos(
+    caixas: tuple[Caixa, ...], largura: int, altura: int
+) -> tuple[Caixa, Caixa] | None:
+    """Devolve ``(tabela, cabecalho)`` do Modelo 5, ou ``None`` sem rotulos."""
+    rotulos = [(c, rotulo_modelo5(c.texto)) for c in caixas]
+    rotulos = [(c, nome) for c, nome in rotulos if nome]
+    principais = [c for c, nome in rotulos if nome in {"entrada", "saida"}]
+    nomes_principais = {
+        nome for _c, nome in rotulos if nome in {"entrada", "saida"}
+    }
+    complementares = [
+        c for c, nome in rotulos if nome in {"assinatura", "horas"}
+    ]
+    if nomes_principais != {"entrada", "saida"} or len(complementares) < 3:
+        return None
+
+    topo_rotulos = min(c.y for c in principais)
+    # Os rotulos validos ficam na faixa do cabecalho da propria pagina; um
+    # "DIA MES" da pagina vizinha do caderno (a direita) fica de fora.
+    x_entrada = min(c.x for c, nome in rotulos if nome == "entrada")
+    faixa_cab = [
+        c
+        for c, nome in rotulos
+        if c.y <= topo_rotulos + 120
+        and (nome != "dia" or c.x < x_entrada)
+    ]
+    cabecalhos = [
+        c.y2
+        for c in caixas
+        if c.texto
+        and _TITULO_M5_RE.search(_sem_acento(c.texto))
+        and c.y2 <= topo_rotulos + 0.5 * c.altura
+        and c.y2 > topo_rotulos - 80
+    ]
+    corte = (max(cabecalhos) + 1.0) if cabecalhos else topo_rotulos
+    if corte < 8.0:
+        return None
+
+    # Linhas de registro: contiguas abaixo do corte, dentro da faixa dos
+    # rotulos. A borda direita para na ultima coluna HORAS, para nao levar a
+    # pagina vizinha.
+    x_min_rot = min(c.x for c in faixa_cab)
+    x_max_rot = max(c.x2 for c in faixa_cab)
+    banda = [
+        c
+        for c in caixas
+        if c.texto
+        and c.y > corte
+        and c.x >= x_min_rot - 0.45 * (x_max_rot - x_min_rot)
+        and c.x <= x_max_rot + 20
+        and c.x2 <= largura
+    ]
+    if not banda:
+        return None
+    banda.sort(key=lambda c: c.y)
+    fim = banda[0].y2
+    for c in banda[1:]:
+        if c.y - fim > 120:
+            break
+        fim = max(fim, c.y2)
+    linhas = [c for c in banda if c.y2 <= fim and c.x >= 20]
+    if len(linhas) < 8:
+        return None
+    esquerda = max(0.0, min(c.x for c in linhas) - 4.0)
+    direita = min(float(largura), max(c.x2 for c in linhas) + 6.0)
+    base = min(float(altura), fim + 8.0)
+    if direita - esquerda < 200 or base - corte < 100:
+        return None
+    tabela = Caixa(x=esquerda, y=corte, largura=direita - esquerda, altura=base - corte)
+    cabecalho = Caixa(x=0.0, y=0.0, largura=float(largura), altura=corte)
+    return tabela, cabecalho
 
 
 def _extrair(
@@ -778,6 +914,19 @@ def _extrair(
 ) -> DeteccaoEstrutural:
     tabelas = _tabelas(data)
     caixas_texto = tuple(_blocos_texto(data))
+
+    if not tabelas and modelo == "modelo-5":
+        derivada = _tabela_modelo5_por_rotulos(caixas_texto, largura, altura)
+        if derivada is not None:
+            return DeteccaoEstrutural(
+                largura=largura,
+                altura=altura,
+                tabela=derivada[0],
+                cabecalho=derivada[1],
+                caixas_texto=caixas_texto,
+                modelo_versao=_versao,
+                aviso_ancora=_AVISO_LAYOUT_ROTULOS,
+            )
 
     if not tabelas:
         return DeteccaoEstrutural(
@@ -810,6 +959,10 @@ def _extrair(
         linhas_completas,
         imagem,
     )
+    if inicio is None and modelo == "modelo-5":
+        derivada = _tabela_modelo5_por_rotulos(caixas_texto, largura, altura)
+        if derivada is not None:
+            inicio, aviso_ancora = derivada[0].y, _AVISO_LAYOUT_ROTULOS
 
     cabecalho: Caixa | None = None
     if inicio is not None and 8.0 <= inicio < tabela.y2:
@@ -836,8 +989,9 @@ def _extrair(
             "O inicio calculado nao esta dentro da tabela de ponto.",
         )
 
-    # Limita o rodape após o ajuste do recorte
-    if cabecalho is not None:
+    # Limita o rodape após o ajuste do recorte. O caderno do Modelo 5 nao tem
+    # rodape: a pagina e so linhas de registro.
+    if cabecalho is not None and modelo != "modelo-5":
         fim = _limitar_rodape(tabela, caixas_texto)
         if fim is not None and tabela.y + 32.0 < fim < tabela.y2:
             tabela = Caixa(
@@ -861,7 +1015,55 @@ def _extrair(
         confianca=confianca,
         modelo_versao=_versao,
         aviso_ancora=aviso_ancora,
+        ancorada=(
+            inicio is not None
+            and cabecalho is not None
+            and modelo in _MODELOS_COM_ANCORA
+        ),
     )
+
+
+# Segunda tentativa do modelo de layout quando a primeira nao acha nenhuma
+# tabela. Fotos de cartoes com grade fina e quase vazia (variacao B do Modelo 1)
+# recebem score de ``table`` abaixo do corte padrao. A tentativa so ocorre
+# quando a primeira falhou, entao imagens que ja funcionam nao mudam. O limiar
+# nao pode ser menor: com 0.1 o modelo devolveu menos blocos e nenhuma tabela.
+_LAYOUT_THRESHOLD_RETRY = 0.3
+_MODELOS_RETRY_LAYOUT = frozenset({"modelo-1"})
+
+
+def _detectar_limiar_baixo(
+    estrutura: Any,
+    entrada: Any,
+    largura: int,
+    altura: int,
+    modelo: str | None,
+    imagem: Any,
+) -> DeteccaoEstrutural | None:
+    """Repete a inferencia com limiar menor; devolve ``None`` se nao ajudar.
+
+    Qualquer falha aqui preserva o resultado original (sem tabela), de modo que
+    o bloqueio fail-closed continua valendo.
+    """
+    try:
+        saida = estrutura.predict(entrada, layout_threshold=_LAYOUT_THRESHOLD_RETRY)
+        if not isinstance(saida, (list, tuple)):
+            saida = list(saida)
+        if not saida:
+            return None
+        deteccao = _extrair(
+            _como_dicionario(saida[0]),
+            largura,
+            altura,
+            modelo=modelo,
+            imagem=imagem,
+        )
+    except ErroDeteccao:
+        # Achou tabela, mas a ancora recusou: o diagnostico e o bloqueio valem.
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+    return deteccao if deteccao.tabela is not None else None
 
 
 def detectar(
@@ -905,13 +1107,20 @@ def detectar(
                 "O modelo estrutural nao retornou resultado.",
             )
         data = _como_dicionario(saida[0])
-        return _extrair(
+        deteccao = _extrair(
             data,
             largura,
             altura,
             modelo=modelo,
             imagem=imagem,
         )
+        if deteccao.tabela is None and modelo in _MODELOS_RETRY_LAYOUT:
+            refeita = _detectar_limiar_baixo(
+                estrutura, entrada, largura, altura, modelo, imagem
+            )
+            if refeita is not None:
+                return refeita
+        return deteccao
     except ErroDeteccao:
         raise
     except Exception as exc:  # noqa: BLE001

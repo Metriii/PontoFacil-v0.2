@@ -297,3 +297,32 @@ enviado.
   e marca revisão quando a sequência fica incoerente.
 - O banco continua guardando apenas o dia; dias iguais em meses diferentes
   colidem, como nos demais modelos.
+
+---
+
+## Correções de leitura e pareamento (2026-11-13)
+
+Com a imagem anonimizada (assinaturas mascaradas, título cortado), o OCR do
+caderno passou a errar de formas previsíveis. O parser do Modelo 5
+(`backend/modelo5/parser.py`) corrige, antes do núcleo compartilhado:
+
+| Leitura do OCR | Correção |
+|---|---|
+| `D2`, `O3`, `D10` nas colunas de data | `02`, `03`, `10` |
+| `DIA`/`MÊS` na mesma linha de horários (cabeçalho fundido) | vira linha de dados sem data |
+| `08%` + `00` (traço da coluna HORAS entre hora e minuto) | `08:00` |
+| `08800` (dois-pontos manuscrito lido como `8`) | `08:00`, só se for horário válido; dia marcado para revisão |
+| anos diferentes na coluna Nº (`26`, `10`, `20`, `16`) | ano mais frequente |
+
+**Pareamento manhã/tarde** (`parear_turnos`, usado por `mapper.mapear_folha`):
+cada data tem a 1ª linha = entrada e saída da manhã e a 2ª = volta e saída da
+tarde. As linhas são agrupadas pela data lida quando ela bate; senão, pela
+ordem e pelo turno (última batida a partir de 14:30 = tarde). A data de cada
+dia é a menor data lida maior que a do dia anterior, o que corrige a coluna de
+datas deslocada pelo OCR. Data ajustada recebe a observação "Data ajustada pela
+ordem das linhas do caderno" e fica para revisão. Linhas sem horário (feriado)
+mantêm a data lida.
+
+Limite: quando o OCR lê o próprio horário errado (`12:02` como `08:02`), o
+parser não adivinha; o dia sai com alerta ("Jornada acima de 10 horas") para
+correção na revisão.

@@ -330,5 +330,161 @@ class TestDeteccaoLocal(unittest.TestCase):
         self.assertEqual(deteccao.altura, 1200)
 
 
+class TestSegundaTentativaLayout(unittest.TestCase):
+    """Limiar de layout menor so quando a 1a passada nao acha tabela (Modelo 1)."""
+
+    SEM_TABELA = {"layout_det_res": {"boxes": []}}
+    COM_TABELA = {
+        "layout_det_res": {
+            "boxes": [
+                {"label": "table", "score": 0.48, "coordinate": [40, 300, 860, 1100]}
+            ]
+        }
+    }
+
+    def _modelo(self, respostas):
+        chamadas: list[dict] = []
+
+        class ModeloFalso:
+            def predict(self, _entrada, **kwargs):
+                chamadas.append(kwargs)
+                if isinstance(respostas, Exception):
+                    if kwargs:
+                        raise respostas
+                    return [TestSegundaTentativaLayout.SEM_TABELA]
+                return [respostas[1 if kwargs else 0]]
+
+        return ModeloFalso(), chamadas
+
+    def _detectar(self, modelo_falso, modelo):
+        with patch.object(
+            detector, "_carregar_modelo", return_value=modelo_falso
+        ), patch.object(detector, "_resolver_inicio", return_value=(None, None)):
+            return detector.detectar(criar_folha_sintetica(), modelo=modelo)
+
+    def test_modelo1_sem_tabela_repete_com_limiar_menor(self) -> None:
+        falso, chamadas = self._modelo((self.SEM_TABELA, self.COM_TABELA))
+        deteccao = self._detectar(falso, "modelo-1")
+        self.assertIsNotNone(deteccao.tabela)
+        self.assertEqual(
+            chamadas, [{}, {"layout_threshold": detector._LAYOUT_THRESHOLD_RETRY}]
+        )
+
+    def test_primeira_passada_com_tabela_nao_repete(self) -> None:
+        falso, chamadas = self._modelo((self.COM_TABELA, self.COM_TABELA))
+        deteccao = self._detectar(falso, "modelo-1")
+        self.assertIsNotNone(deteccao.tabela)
+        self.assertEqual(chamadas, [{}])
+
+    def test_modelo3_nao_repete(self) -> None:
+        falso, chamadas = self._modelo((self.SEM_TABELA, self.COM_TABELA))
+        deteccao = self._detectar(falso, "modelo-3")
+        self.assertIsNone(deteccao.tabela)
+        self.assertEqual(chamadas, [{}])
+
+    def test_sem_modelo_nao_repete(self) -> None:
+        falso, chamadas = self._modelo((self.SEM_TABELA, self.COM_TABELA))
+        deteccao = self._detectar(falso, None)
+        self.assertIsNone(deteccao.tabela)
+        self.assertEqual(chamadas, [{}])
+
+    def test_segunda_passada_sem_tabela_mantem_bloqueio(self) -> None:
+        falso, chamadas = self._modelo((self.SEM_TABELA, self.SEM_TABELA))
+        deteccao = self._detectar(falso, "modelo-1")
+        self.assertIsNone(deteccao.tabela)
+        self.assertEqual(len(chamadas), 2)
+
+    def test_falha_na_repeticao_preserva_resultado_original(self) -> None:
+        falso, chamadas = self._modelo(TypeError("limiar nao suportado"))
+        deteccao = self._detectar(falso, "modelo-1")
+        self.assertIsNone(deteccao.tabela)
+        self.assertEqual(len(chamadas), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTabelaModelo5PorRotulos(unittest.TestCase):
+    """Modelo 5: sem ``table`` do layout, a regiao sai dos rotulos impressos."""
+
+    def _caixas(self, com_rotulos: bool = True):
+        caixas = [
+            Caixa(254, 303, 490, 47, texto="REGISTRO DE PONTO NOME"),
+            Caixa(0, 338, 34, 32, texto="RAS"),
+        ]
+        if com_rotulos:
+            caixas += [
+                Caixa(295, 346, 111, 32, texto="ENTRADA"),
+                Caixa(567, 346, 78, 31, texto="SAIDA"),
+                Caixa(102, 367, 74, 29, texto="DIA MES"),
+                Caixa(266, 369, 90, 30, texto="ASSINATURA"),
+                Caixa(413, 377, 57, 25, texto="HORAS"),
+                Caixa(532, 373, 90, 28, texto="ASSINATURA"),
+                Caixa(680, 366, 66, 29, texto="HORAS"),
+            ]
+        for i in range(12):
+            y = 400 + i * 35
+            caixas.append(Caixa(98, y, 110, 30, texto="020926"))
+            caixas.append(Caixa(407, y, 72, 26, texto="08:06"))
+        return tuple(caixas)
+
+    def test_corte_abaixo_do_titulo_e_nome_fica_acima(self) -> None:
+        resultado = detector._tabela_modelo5_por_rotulos(
+            self._caixas(), 900, 1600
+        )
+        self.assertIsNotNone(resultado)
+        tabela, cabecalho = resultado
+        self.assertGreaterEqual(tabela.y, 350)
+        self.assertAlmostEqual(cabecalho.y2, tabela.y)
+        self.assertGreaterEqual(tabela.x, 80)  # "RAS" da pagina ao lado fica fora
+
+    def test_sem_rotulos_nao_deriva_tabela(self) -> None:
+        self.assertIsNone(
+            detector._tabela_modelo5_por_rotulos(
+                self._caixas(com_rotulos=False), 900, 1600
+            )
+        )
+
+
+class TestRotulosModelo5Tortos(unittest.TestCase):
+    def test_aceita_leituras_tortas_comuns(self) -> None:
+        for texto, esperado in (
+            ("BAIDA", "saida"),
+            ("SAIDA", "saida"),
+            ("ARBINATURA", "assinatura"),
+            ("ABBINATURA", "assinatura"),
+            ("HORAB", "horas"),
+            ("ENTRADA", "entrada"),
+            ("E N T R A D A", "entrada"),
+        ):
+            self.assertEqual(detector.rotulo_modelo5(texto), esperado, texto)
+
+    def test_nao_aceita_texto_qualquer(self) -> None:
+        for texto in ("Rafael", "08:00", "BANDA", "HORARIO"):
+            self.assertIsNone(detector.rotulo_modelo5(texto), texto)
+
+    def test_pagina_vizinha_fica_fora_da_borda_direita(self) -> None:
+        caixas = [
+            Caixa(242, 312, 376, 44, texto="REGISTRO DE PONTO"),
+            Caixa(285, 367, 111, 24, texto="ENTRADA"),
+            Caixa(586, 359, 82, 34, texto="BAIDA"),
+            Caixa(252, 392, 90, 27, texto="ARBINATURA"),
+            Caixa(412, 392, 60, 25, texto="HORAB"),
+            Caixa(546, 392, 93, 25, texto="ABBINATURA"),
+            Caixa(705, 401, 52, 37, texto="HORAS"),
+            Caixa(803, 442, 69, 29, texto="DIA MEB"),  # pagina vizinha
+        ]
+        for i in range(10):
+            y = 420 + i * 25
+            caixas += [
+                Caixa(70, y, 80, 22, texto="2409"),
+                Caixa(405, y, 75, 22, texto="08:12"),
+                Caixa(735, y, 30, 22, texto="12"),
+                Caixa(805, y, 90, 22, texto="011026"),  # pagina vizinha
+            ]
+        resultado = detector._tabela_modelo5_por_rotulos(tuple(caixas), 900, 1600)
+        self.assertIsNotNone(resultado)
+        tabela, _cab = resultado
+        self.assertLess(tabela.x2, 800)
+        self.assertLessEqual(tabela.x, 70)

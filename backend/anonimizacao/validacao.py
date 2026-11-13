@@ -141,6 +141,238 @@ def _mesma_coluna(a: Caixa, b: Caixa) -> bool:
 # tambem bloqueia por sobreposicao de coluna.
 MODELOS_MASCARA_LOCALIZADA = frozenset({"modelo-1", "modelo-2", "modelo-4"})
 
+# Modelos 1, 2 e 3: quando o recorte foi decidido por uma ancora (``ancorada``),
+# o cabecalho pessoal ja foi descartado e tudo abaixo do corte e a tabela de
+# ponto. Nao ha segunda validacao de campo sensivel dentro dela: o texto e
+# preservado, sem bloquear e sem redigir (redigir apagaria carimbos de horario
+# lidos como numeros colados, que a regra tomava por CPF/nome). A sobra de
+# cabecalho que atravessa a linha de corte continua sendo tratada, e a previa
+# humana antes do MCP continua obrigatoria.
+MODELOS_ANCORA_DISPENSA_CONFLITO = frozenset(
+    {"modelo-1", "modelo-2", "modelo-3"}
+)
+
+# Modelo 2: so as colunas ate a ``Saida`` apos o intervalo sao dados de ponto.
+# As colunas da direita (Hora Extra e Assinatura) carregam assinatura manuscrita
+# e sao cobertas por mascara branca.
+_SAIDA_ROTULO_RE = re.compile(r"\bsa[i1l]da\b")
+_FAIXA_MASCARA_PX = 40.0
+_INCLINACAO_MAX = 0.1  # tangente (~5,7 graus)
+
+
+def _mediana_simples(valores: list[float]) -> float:
+    ordenados = sorted(valores)
+    return ordenados[len(ordenados) // 2]
+
+
+def mascara_colunas_direita_modelo2(
+    deteccao: DeteccaoEstrutural,
+) -> tuple[Caixa, ...]:
+    """Mascara que cobre tudo a direita da ``Saida`` final (Modelo 2).
+
+    Usa so rotulos fixos do cabecalho (``Saida``, ``Entrada``, ``Hora Extra``)
+    e as celulas da grade, nunca texto manuscrito. Devolve vazio quando nao ha
+    como localizar a coluna com seguranca (a previa humana segue obrigatoria).
+    """
+    tabela = deteccao.tabela
+    if tabela is None:
+        return ()
+    caixas = [c for c in deteccao.caixas_texto if c.texto]
+    primeiros = [
+        c.y
+        for c in caixas
+        if _parece_horario(c.texto) and c.y > tabela.y + 2
+    ]
+    if not primeiros:
+        return ()
+    limite_cab = min(primeiros)
+    cabecalho = [
+        c
+        for c in caixas
+        if c.y >= tabela.y - 4
+        and c.y <= limite_cab + 4
+        and (c.y + c.y2) / 2 <= limite_cab + 0.8 * c.altura
+        and tabela.x - 4 <= c.x <= tabela.x2
+    ]
+    saidas = sorted(
+        (c for c in cabecalho if _SAIDA_ROTULO_RE.search(_sem_acento(c.texto))),
+        key=lambda c: c.x,
+    )
+    final: Caixa | None = None
+    if len(saidas) >= 3:
+        final = saidas[1]
+    elif saidas:
+        # Sem as tres: escolhe a que esta no meio da tabela (cerca de 50%).
+        def _fracao(c: Caixa) -> float:
+            return ((c.x + c.x2) / 2 - tabela.x) / max(1.0, tabela.largura)
+
+        candidatas = [c for c in saidas if 0.38 <= _fracao(c) <= 0.62]
+        if len(candidatas) == 1:
+            final = candidatas[0]
+    if final is None:
+        return ()
+
+    vizinhos = [
+        c
+        for c in cabecalho
+        if c.x >= final.x2 - 4
+        and (c.x + c.x2) / 2 > (final.x + final.x2) / 2
+        and _eh_rotulo_coluna(c.texto)
+    ]
+    if not vizinhos:
+        return ()
+    vizinho = min(vizinhos, key=lambda c: c.x)
+    folga = max(0.0, vizinho.x - final.x2)
+    corte = vizinho.x - 0.25 * folga
+    y_ref = (final.y + final.y2) / 2
+
+    inclinacao = 0.0
+    celulas = [c.caixa for c in deteccao.celulas]
+    if celulas:
+        tol = 0.35 * _mediana_simples([c.largura for c in celulas])
+        pontos = [
+            ((c.y + c.y2) / 2, c.x2)
+            for c in celulas
+            if abs(c.x2 - corte) <= tol
+        ]
+        if len(pontos) >= 4:
+            ys = [p[0] for p in pontos]
+            xs = [p[1] for p in pontos]
+            my = sum(ys) / len(ys)
+            mx = sum(xs) / len(xs)
+            var = sum((y - my) ** 2 for y in ys)
+            if var > 0 and (max(ys) - min(ys)) > 4 * _FAIXA_MASCARA_PX:
+                m = sum((y - my) * (x - mx) for y, x in pontos) / var
+                if abs(m) <= _INCLINACAO_MAX:
+                    inclinacao = m
+
+    x_fim = tabela.x2 + 6.0
+    mascaras: list[Caixa] = []
+    y = tabela.y
+    while y < tabela.y2:
+        y_fim = min(tabela.y2, y + _FAIXA_MASCARA_PX)
+        x_ini = max(
+            corte + inclinacao * (y - y_ref),
+            corte + inclinacao * (y_fim - y_ref),
+        )
+        if x_fim > x_ini:
+            mascaras.append(
+                Caixa(x=x_ini, y=y, largura=x_fim - x_ini, altura=y_fim - y)
+            )
+        y = y_fim
+    return tuple(mascaras)
+
+
+# Modelo 5 (REGISTRO DE PONTO): as colunas ASSINATURA de ENTRADA e de SAIDA
+# trazem o nome do funcionario escrito a mao em todas as linhas e sao cobertas
+# por mascara branca. Sobram DIA/MES/N e as duas colunas HORAS. A coluna e
+# localizada pelos rotulos impressos e pelas caixas das colunas vizinhas
+# (datas e HORAS), acompanhadas em faixas de 40 px para absorver inclinacao.
+_DATA_M5_RE = re.compile(r"^\d[\d\s/.\-]{3,}$")
+# Leituras tortas do OCR (S como B/R/5, O como 0, I como 1/L).
+_HORAS_M5_RE = re.compile(r"\bh[o0]ra[sbr5]\b")
+_ASSINATURA_M5_RE = re.compile(r"\ba[sbr5]{2}[i1l]natura")
+
+
+def _centro_x(caixa: Caixa) -> float:
+    return (caixa.x + caixa.x2) / 2
+
+
+def _centro_y(caixa: Caixa) -> float:
+    return (caixa.y + caixa.y2) / 2
+
+
+def mascara_assinaturas_modelo5(
+    deteccao: DeteccaoEstrutural,
+) -> tuple[Caixa, ...]:
+    """Mascaras das colunas ASSINATURA (entrada e saida) do Modelo 5."""
+    tabela = deteccao.tabela
+    if tabela is None:
+        return ()
+    caixas = [c for c in deteccao.caixas_texto if c.texto]
+    zona = [
+        c
+        for c in caixas
+        if tabela.y - 4 <= c.y <= tabela.y + 0.15 * tabela.altura
+        and tabela.x - 4 <= c.x <= tabela.x2
+    ]
+    horas = sorted(
+        (c for c in zona if _HORAS_M5_RE.search(_sem_acento(c.texto))),
+        key=lambda c: c.x,
+    )
+    assinaturas = sorted(
+        (c for c in zona if _ASSINATURA_M5_RE.search(_sem_acento(c.texto))),
+        key=lambda c: c.x,
+    )
+    if len(horas) < 2 or not assinaturas:
+        return ()
+    hora_e, hora_s = horas[0], horas[1]
+    base_cab = max(hora_e.y2, hora_s.y2)
+    corpo = [c for c in caixas if base_cab - 2 <= c.y < tabela.y2]
+    if len(corpo) < 6:
+        return ()
+
+    def _seguir(
+        centro: float, meia_largura: float, y_ini: float, y_fim: float
+    ) -> list[Caixa]:
+        # Caixas largas demais sao linhas inteiras fundidas pelo OCR (data +
+        # assinatura + horas) e nao dizem onde a coluna HORAS esta.
+        return [
+            c
+            for c in corpo
+            if y_ini <= _centro_y(c) <= y_fim
+            and abs(_centro_x(c) - centro) <= meia_largura
+            and c.largura <= 2.0 * meia_largura
+        ]
+
+    meia_e = max(30.0, 0.9 * hora_e.largura)
+    meia_s = max(30.0, 0.9 * hora_s.largura)
+    datas_ref = [
+        c
+        for c in corpo
+        if _DATA_M5_RE.match(c.texto.strip())
+        and _centro_x(c) < assinaturas[0].x
+    ]
+    if datas_ref:
+        x2_datas = sorted(c.x2 for c in datas_ref)
+        x_datas = x2_datas[int(0.9 * (len(x2_datas) - 1))]
+    else:
+        x_datas = assinaturas[0].x - 0.5 * assinaturas[0].largura
+
+    centro_e, centro_s = _centro_x(hora_e), _centro_x(hora_s)
+    ini_e, fim_e = hora_e.x - 6.0, hora_e.x2 + 6.0
+    ini_s = hora_s.x - 6.0
+    # Borda esquerda da 1a ASSINATURA: pelo rotulo impresso (a coluna comeca
+    # cerca de 0,7 largura de rotulo antes dele). As datas so refinam quando
+    # foram lidas sozinhas; fundidas com a assinatura, elas avancam demais.
+    esq = assinaturas[0].x - 0.7 * assinaturas[0].largura
+    if esq < x_datas + 2.0 < assinaturas[0].x - 0.2 * assinaturas[0].largura:
+        esq = x_datas + 2.0
+
+    mascaras: list[Caixa] = []
+    # Comeca logo abaixo dos rotulos ASSINATURA: o rotulo HORAS pode estar
+    # inclinado e descer sobre a primeira linha.
+    y = min(c.y2 for c in assinaturas) + 1.0
+    while y < tabela.y2:
+        y_fim = min(tabela.y2, y + _FAIXA_MASCARA_PX)
+        he = _seguir(centro_e, meia_e, y - 20.0, y_fim + 20.0)
+        hs = _seguir(centro_s, meia_s, y - 20.0, y_fim + 20.0)
+        if he:
+            ini_e = min(c.x for c in he) - 3.0
+            fim_e = max(c.x2 for c in he) + 3.0
+            centro_e = sorted(_centro_x(c) for c in he)[len(he) // 2]
+        if hs:
+            ini_s = min(c.x for c in hs) - 3.0
+            centro_s = sorted(_centro_x(c) for c in hs)[len(hs) // 2]
+        for x_ini, x_fim in ((esq, ini_e), (fim_e, ini_s)):
+            if x_fim - x_ini > 20.0:
+                mascaras.append(
+                    Caixa(x=x_ini, y=y, largura=x_fim - x_ini, altura=y_fim - y)
+                )
+        y = y_fim
+    return tuple(mascaras)
+
+
 # ``recorte.redigir_caixas`` pinta ``padding=2`` alem da caixa; mais 2 px de
 # folga para imprecisao da caixa do OCR.
 _MARGEM_MASCARA_PX = 4.0
@@ -247,6 +479,20 @@ def analisar_sensiveis(
     conflitou = False
     motivo: str | None = None
     tipos_conflito: list[str] = []  # so para o log; nunca guarda texto lido
+    ancora_dispensa_conflito = (
+        deteccao.ancorada and modelo in MODELOS_ANCORA_DISPENSA_CONFLITO
+    )
+
+    if ancora_dispensa_conflito and modelo == "modelo-2":
+        redigir.extend(mascara_colunas_direita_modelo2(deteccao))
+    if modelo == "modelo-5":
+        assinaturas_m5 = mascara_assinaturas_modelo5(deteccao)
+        redigir.extend(assinaturas_m5)
+        # Com as colunas ASSINATURA mascaradas, o nome so aparecia nelas. O
+        # OCR costuma fundir data + assinatura + horas numa caixa so; redigir
+        # essa caixa apagaria datas e horarios. Fica so a mascara de coluna.
+        if assinaturas_m5:
+            ancora_dispensa_conflito = True
 
     for caixa in straddling:
         # A sobra de cabecalho pode atravessar a largura da tabela; so bloqueia
@@ -278,6 +524,10 @@ def analisar_sensiveis(
             if caixa.y < limite:
                 redigir.append(caixa)
             # Caixa abaixo do limite e preservada (dado de ponto) - nao faz nada
+            continue
+
+        if ancora_dispensa_conflito:
+            # Corte decidido por ancora: o que esta abaixo e tabela de ponto.
             continue
 
         # Campo sensivel: verifica se o conflito com horarios e real.

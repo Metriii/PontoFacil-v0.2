@@ -7,6 +7,8 @@ lista os dias em branco da quinzena).
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..modelo4 import mapper as _base
 from ..modelo4.parser import LAYOUT_DUAS_LINHAS
 from ..modelos import Registro
@@ -22,11 +24,28 @@ def mapear_folha(
     funcionario: str | None,
     jornada: object | None = None,
 ) -> tuple[list[Registro], list[list[str]]]:
-    return _base.mapear_folha(
-        linhas,
-        referencia,
-        funcionario,
-        jornada,
-        layout=LAYOUT_DUAS_LINHAS,
-        separador=_parser.separar_linha,
-    )
+    """Duas linhas por data: 1a = manha (entrada/saida intervalo), 2a = tarde.
+
+    As linhas sao pareadas pela ordem e pelo turno (``parser.parear_turnos``),
+    nao so pela data lida, que o OCR erra com frequencia no caderno.
+    """
+    del jornada
+    mes, ano = _base._periodo_referencia(referencia)
+    campos = [
+        replace(campo, layout=LAYOUT_DUAS_LINHAS)
+        for linha in linhas
+        if (campo := _parser.separar_linha(linha, mes, ano)) is not None
+    ]
+    campos = _parser.normalizar_anos(campos)
+    campos = _parser.parear_turnos(campos)
+
+    registros: list[Registro] = []
+    linhas_excel: list[list[str]] = []
+    for indice, grupo in enumerate(_base._grupos(campos).values()):
+        registro, linha_excel = _base._mapear_grupo(
+            grupo, indice, referencia, funcionario
+        )
+        linhas_excel.append(linha_excel)
+        if registro_tem_conteudo(registro):
+            registros.append(registro)
+    return registros, linhas_excel

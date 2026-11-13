@@ -71,6 +71,68 @@ def _hora_ilegivel(linha: list[str]) -> bool:
     return False
 
 
+# Leituras tortas do caderno (Modelo 5), corrigidas antes do nucleo:
+# - ``D2``/``O3`` nas colunas de data: o ``0`` manuscrito lido como letra;
+# - ``08%`` + ``00``: a coluna HORAS tem um traco entre hora e minuto e o
+#   dois-pontos manuscrito (parecido com ``§``) vira ``%``/``$``;
+# - ``08800``: o mesmo dois-pontos lido como ``8``. So vale quando o
+#   resultado e um horario valido, e o dia fica marcado para revisao.
+_DIGITO_LETRA_RE = re.compile(r"^\s*[DOo]\s*(\d{1,2})\s*$")
+_HORA_PARTIDA_RE = re.compile(r"^\s*(\d{1,2})\s*[%§$:;]\s*$")
+_MINUTO_RE = re.compile(r"^\s*(\d{2})\s*$")
+_HORA_OITO_RE = re.compile(r"^\s*(\d{2})8(\d{2})\s*$")
+_COLUNAS_DATA = 3
+_HORARIO_SIMPLES_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+
+def _hora_valida(hora: str, minuto: str) -> bool:
+    return int(hora) <= 23 and int(minuto) <= 59
+
+
+def corrigir_linha(linha: list[str]) -> tuple[list[str], bool]:
+    """Corrige leituras tortas do caderno; devolve ``(linha, suspeita)``.
+
+    ``suspeita`` indica que um ``8`` foi lido como dois-pontos: o horario e
+    plausivel, mas precisa de conferencia humana.
+    """
+    nova: list[str] = []
+    suspeita = False
+    indice = 0
+    while indice < len(linha):
+        celula = linha[indice] or ""
+        if indice < _COLUNAS_DATA and (m := _DIGITO_LETRA_RE.match(celula)):
+            nova.append(f"{int(m.group(1)):02d}")
+            indice += 1
+            continue
+        # Linha de cabecalho fundida com a primeira linha de dados: os
+        # rotulos DIA/MES ocupam as colunas de data, mas ha horarios depois.
+        if (
+            indice < _COLUNAS_DATA
+            and _rotulo(celula) in {"DIA", "MES"}
+            and any(_HORARIO_SIMPLES_RE.search(c or "") for c in linha)
+        ):
+            nova.append("")
+            indice += 1
+            continue
+        partida = _HORA_PARTIDA_RE.match(celula)
+        proxima = linha[indice + 1] if indice + 1 < len(linha) else ""
+        minuto = _MINUTO_RE.match(proxima or "")
+        if partida and minuto and _hora_valida(partida.group(1), minuto.group(1)):
+            nova.append(f"{int(partida.group(1)):02d}:{minuto.group(1)}")
+            nova.append("")  # mantem o numero de colunas
+            indice += 2
+            continue
+        oito = _HORA_OITO_RE.match(celula)
+        if oito and _hora_valida(oito.group(1), oito.group(2)):
+            nova.append(f"{oito.group(1)}:{oito.group(2)}")
+            suspeita = True
+            indice += 1
+            continue
+        nova.append(celula)
+        indice += 1
+    return nova, suspeita
+
+
 def separar_linha(
     linha: list[str],
     mes: int | None = None,
@@ -83,7 +145,10 @@ def separar_linha(
     batidas como ``08900``). Aqui o dia e preservado com uma observacao, para
     aparecer na revisao e na planilha.
     """
+    linha, suspeita = corrigir_linha(linha)
     campos = _base.separar_linha(linha, mes, ano)
+    if campos is not None and suspeita and campos.horas:
+        campos = replace(campos, forcar_revisao=True)
     if campos is None or campos.horas or campos.observacao:
         return campos
     if campos.dia is None or not _hora_ilegivel(linha):
@@ -298,3 +363,142 @@ def validar_layout(
             "processe-a no Modelo 4."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Pareamento das duas linhas de cada data (manha / tarde)
+# ---------------------------------------------------------------------------
+
+AJUSTE_DATA_PELA_ORDEM = (
+    "Data ajustada pela ordem das linhas do caderno; conferir o registro original."
+)
+_TARDE_MIN = 14 * 60 + 30  # ultima batida a partir de 14:30 = turno da tarde
+_MANHA_INICIO_MAX = 10 * 60  # primeira batida antes das 10:00 = manha
+
+
+def _minutos(hora: str) -> int | None:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", hora or "")
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def _turno(campo: CamposLinha) -> str | None:
+    """``manha``, ``tarde`` ou ``None`` (sem horas ou ambiguo)."""
+    minutos = [m for h in campo.horas if (m := _minutos(h)) is not None]
+    if not minutos:
+        return None
+    primeira, ultima = minutos[0], minutos[-1]
+    if ultima < _TARDE_MIN:
+        return "manha"
+    if primeira >= _MANHA_INICIO_MAX:
+        return "tarde"
+    return None  # comeca de manha e termina a tarde: decide pela posicao
+
+
+def normalizar_anos(campos: list[CamposLinha]) -> list[CamposLinha]:
+    """Usa o ano mais frequente quando o OCR leu anos diferentes na coluna N.
+
+    No caderno a coluna ``N`` traz o ano (26); leituras tortas (10, 20, 16)
+    separavam as duas linhas da mesma data em dias diferentes.
+    """
+    anos = [c.ano for c in campos if c.ano is not None]
+    if len(set(anos)) < 2:
+        return campos
+    frequente = max(set(anos), key=anos.count)
+    return [
+        replace(c, ano=frequente) if c.ano is not None and c.ano != frequente else c
+        for c in campos
+    ]
+
+
+def parear_turnos(campos: list[CamposLinha]) -> list[CamposLinha]:
+    """Agrupa as linhas em dias (1a = manha, 2a = tarde) e acerta a data.
+
+    Regras, na ordem:
+
+    1. linha sem horario fica sozinha (feriado, dia em branco);
+    2. linha com a mesma data lida do dia em aberto (com uma linha so) entra
+       nesse dia;
+    3. senao, linha da tarde (ou ambigua) entra no dia em aberto que so tem a
+       manha;
+    4. senao, comeca um dia novo.
+
+    A data de cada dia e a menor data lida em suas linhas que seja maior que a
+    do dia anterior. Quando o OCR desloca a coluna de datas (``DIA``, 02, 02,
+    03 em vez de 02, 02, 03, 03), a ordem das linhas corrige. Toda data
+    ajustada fica marcada para revisao.
+    """
+    dias: list[list[CamposLinha]] = []
+    aberto: list[CamposLinha] | None = None
+    for campo in campos:
+        if not campo.horas:
+            # As duas linhas em branco da mesma data (feriado) ficam juntas.
+            ultimo = dias[-1] if dias else None
+            if (
+                ultimo is not None
+                and not any(c.horas for c in ultimo)
+                and campo.dia is not None
+                and ultimo[0].dia == campo.dia
+            ):
+                ultimo.append(campo)
+            else:
+                dias.append([campo])
+            aberto = None
+            continue
+        turno = _turno(campo)
+        if aberto is not None and len(aberto) == 1:
+            mesma_data = campo.dia is not None and campo.dia == aberto[0].dia
+            tarde_apos_manha = turno != "manha" and _turno(aberto[0]) != "tarde"
+            if mesma_data or tarde_apos_manha:
+                # 1a linha = manha. So inverte quando a ordem lida e
+                # claramente tarde -> manha.
+                if turno == "manha" and _turno(aberto[0]) == "tarde":
+                    aberto.insert(0, campo)
+                else:
+                    aberto.append(campo)
+                aberto = None
+                continue
+        aberto = [campo]
+        dias.append(aberto)
+
+    resultado: list[CamposLinha] = []
+    anterior: tuple[int, int] | None = None  # (mes, dia)
+    for dia in dias:
+        lidos = sorted({(c.mes or 0, c.dia) for c in dia if c.dia is not None})
+        if not any(c.horas for c in dia):
+            # Linha sem batida (feriado, dia em branco): mantem a data lida e
+            # so avanca a referencia.
+            resultado.extend(dia)
+            if lidos and (anterior is None or lidos[-1] > anterior):
+                anterior = lidos[-1]
+            continue
+        escolhido: tuple[int, int] | None = None
+        for candidato in lidos:
+            if anterior is None or candidato > anterior:
+                escolhido = candidato
+                break
+        ajustar = False
+        if escolhido is None:
+            if anterior is None:
+                resultado.extend(dia)
+                continue
+            escolhido = (anterior[0], anterior[1] + 1)
+            ajustar = True
+        if any(c.dia != escolhido[1] for c in dia):
+            ajustar = True
+        base = next((c for c in dia if c.mes is not None), dia[0])
+        for c in dia:
+            novo = replace(
+                c,
+                dia=escolhido[1],
+                mes=c.mes if c.mes is not None else base.mes,
+                ano=c.ano if c.ano is not None else base.ano,
+            )
+            if ajustar and c.horas:
+                novo = replace(
+                    novo, ajuste=AJUSTE_DATA_PELA_ORDEM, forcar_revisao=True
+                )
+            resultado.append(novo)
+        anterior = escolhido
+    return resultado

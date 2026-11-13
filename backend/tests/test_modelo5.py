@@ -557,3 +557,97 @@ class TestEndpointModelo5(unittest.TestCase):
             finally:
                 conexao.close()
             self.assertEqual(modelos, [("modelo-5",)])
+
+
+class TestLeiturasTortasCaderno(unittest.TestCase):
+    """Correcoes do Modelo 5 para leituras tortas do OCR no caderno."""
+
+    def test_letra_no_lugar_do_zero_na_data(self) -> None:
+        from backend.modelo5 import parser as p5
+
+        campos = p5.separar_linha(["D2", "09", "26", "", "13:07", "", "17:05"])
+        self.assertEqual(campos.dia, 2)
+        self.assertEqual(campos.horas, ("13:07", "17:05"))
+
+    def test_horario_partido_pelo_traco_da_coluna(self) -> None:
+        from backend.modelo5 import parser as p5
+
+        linha, suspeita = p5.corrigir_linha(["01", "09", "26", "08%", "00", "11%", "03"])
+        self.assertEqual(linha[3], "08:00")
+        self.assertEqual(linha[5], "11:03")
+        self.assertEqual(len(linha), 7)
+        self.assertFalse(suspeita)
+
+    def test_dois_pontos_lido_como_oito_marca_revisao(self) -> None:
+        from backend.modelo5 import parser as p5
+
+        campos = p5.separar_linha(["04", "09", "26", "", "08800", "", "12802"])
+        self.assertEqual(campos.horas, ("08:00", "12:02"))
+        self.assertTrue(campos.forcar_revisao)
+
+    def test_nao_inventa_horario_invalido_nem_junta_datas(self) -> None:
+        from backend.modelo5 import parser as p5
+
+        linha, suspeita = p5.corrigir_linha(["01", "09", "26", "", "38899", "", ""])
+        self.assertEqual(linha, ["01", "09", "26", "", "38899", "", ""])
+        self.assertFalse(suspeita)
+
+
+class TestPareamentoTurnosCaderno(unittest.TestCase):
+    """Modelo 5: 1a linha = manha, 2a = tarde, mesmo com a data deslocada."""
+
+    def _mapear(self, linhas):
+        registros, _excel = mapper.mapear_folha(linhas, "09/2026", "teste")
+        return {
+            r.data: (r.entrada, r.saida_almoco, r.volta_almoco, r.saida)
+            for r in registros
+        }
+
+    def test_coluna_de_datas_deslocada_pelo_ocr(self) -> None:
+        # O OCR fundiu o cabecalho com a 1a linha e deslocou as datas:
+        # DIA, D2, D2, D3, D3, D4 em vez de 02, 02, 03, 03, 04, 04.
+        linhas = [
+            ["DIA", "MÉS", "", "08:06", "", "12:07"],
+            ["D2", "09", "26", "13:07", "", "17:05"],
+            ["D2", "09", "26", "08:08", "", "12:00"],
+            ["D3", "09", "26", "13:03", "", "17:03"],
+            ["D3", "09", "26", "08:07", "", "12:06"],
+            ["D4", "09", "26", "13:07", "", "17:00"],
+            ["D5", "09", "26", "08:00", "", "13:08"],
+            ["D7", "09", "26", "", "", ""],
+            ["D7", "09", "26", "", "", ""],
+            ["D8", "09", "26", "08:08", "", "12:06"],
+            ["D8", "09", "26", "13:05", "", "17:02"],
+            ["D10", "09", "26", "08:03", "", "12:05"],
+            ["D10", "09", "26", "13:02", "", "17:03"],
+        ]
+        dias = self._mapear(linhas)
+        self.assertEqual(dias["2"], ("08:06", "12:07", "13:07", "17:05"))
+        self.assertEqual(dias["3"], ("08:08", "12:00", "13:03", "17:03"))
+        self.assertEqual(dias["4"], ("08:07", "12:06", "13:07", "17:00"))
+        self.assertEqual(dias["5"][:2], ("08:00", "13:08"))
+        self.assertEqual(dias["8"], ("08:08", "12:06", "13:05", "17:02"))
+        self.assertEqual(dias["10"], ("08:03", "12:05", "13:02", "17:03"))
+
+    def test_ano_torto_nao_separa_a_mesma_data(self) -> None:
+        linhas = [
+            ["01", "09", "26", "08%", "00", "11%", "03"],
+            ["01", "09", "10", "12%", "04", "17%", "00"],
+        ]
+        dias = self._mapear(linhas)
+        self.assertEqual(list(dias), ["1"])
+        self.assertEqual(dias["1"], ("08:00", "11:03", "12:04", "17:00"))
+
+    def test_data_ajustada_fica_para_revisao(self) -> None:
+        registros, _ = mapper.mapear_folha(
+            [
+                ["DIA", "MÉS", "", "08:06", "", "12:07"],
+                ["D2", "09", "26", "13:07", "", "17:05"],
+                ["D2", "09", "26", "08:08", "", "12:00"],
+                ["D3", "09", "26", "13:03", "", "17:03"],
+            ],
+            "09/2026",
+            "teste",
+        )
+        terceiro = next(r for r in registros if r.data == "3")
+        self.assertTrue(terceiro.revisar)

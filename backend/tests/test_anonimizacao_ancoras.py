@@ -155,6 +155,16 @@ class TestAncoraModelo2(unittest.TestCase):
             [40, 300, 860, 1100],
         )
 
+        # Sem Saida, o Modelo 2 recorre aos rotulos de coluna (como o Modelo 1).
+        deteccao = detector._extrair(dados, 900, 1200, modelo="modelo-2")
+        self.assertEqual(deteccao.aviso_ancora, "ANCHOR_FALLBACK")
+
+    def test_sem_saida_e_sem_rotulos_bloqueia(self) -> None:
+        dados = _dados_ocr(
+            [("08:00", [160, 350, 250, 370]), ("17:00", [260, 350, 350, 370])],
+            [40, 300, 860, 1100],
+        )
+
         with self.assertRaises(detector.ErroDeteccao) as contexto:
             detector._extrair(dados, 900, 1200, modelo="modelo-2")
 

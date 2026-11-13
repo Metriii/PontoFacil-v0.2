@@ -114,6 +114,10 @@ class DeteccaoEstrutural:
     confianca: float | None = None
     modelo_versao: str | None = None
     aviso_ancora: str | None = None
+    # True quando o inicio do recorte foi decidido por uma ancora do modelo
+    # (quinzena, faixa do mes, Saida, rotulos ou geometria). Tudo abaixo do
+    # corte ja e a tabela de ponto.
+    ancorada: bool = False
 
 
 @dataclass(frozen=True)

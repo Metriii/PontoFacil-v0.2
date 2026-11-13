@@ -11,8 +11,10 @@ comportamento em fotografias reais. Os testes cobrem a logica geometrica:
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -169,7 +171,8 @@ class TestModelo1VariacaoSemQuinzena(unittest.TestCase):
         self.assertEqual(deteccao.tabela.y, _Y_GRADE)
 
     def test_az03_inclinacao_excessiva_bloqueia(self) -> None:
-        inclinacao = (3.0 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL)
+        # Deriva ~3.0 alturas: acima do limite do Modelo 1 (2.5).
+        inclinacao = (4.0 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL)
         with self.assertRaises(detector.ErroDeteccao) as contexto:
             detector._extrair(
                 self._dados_sem_quinzena(inclinacao=inclinacao),
@@ -272,17 +275,26 @@ class TestModelo2AncoraEstrutural(unittest.TestCase):
         assert deteccao.tabela is not None
         self.assertEqual(deteccao.tabela.y, _Y_GRADE)
 
-    def test_pd04_sem_estrutura_nao_inventa_recorte(self) -> None:
+    def test_pd04_sem_grade_recorre_aos_rotulos(self) -> None:
+        # Sem celulas a grade nao fecha; o ultimo recurso e o de rotulos do
+        # Modelo 1 (ANCHOR_FALLBACK).
         dados = _dados_ocr(
             self._textos_cabecalho_incompleto(), _TABELA, None
         )
 
-        with self.assertRaises(detector.ErroDeteccao) as contexto:
-            detector._extrair(dados, 600, 900, modelo="modelo-2")
+        deteccao = detector._extrair(dados, 600, 900, modelo="modelo-2")
 
-        self.assertEqual(
-            contexto.exception.codigo, CodigoFalha.ANCHOR_NOT_CONFIDENT
-        )
+        self.assertEqual(deteccao.aviso_ancora, "ANCHOR_FALLBACK")
+
+    def test_pd04_sem_grade_e_sem_rotulos_bloqueia(self) -> None:
+        textos = [
+            ("CTPS 000/00", [60, 120, 200, 140]),
+            ("Saida", [270, 372, 340, 390]),
+        ] + _horarios_grade(_Y_GRADE)
+        dados = _dados_ocr(textos, _TABELA, None)
+
+        with self.assertRaises(detector.ErroDeteccao):
+            detector._extrair(dados, 600, 900, modelo="modelo-2")
 
     def test_ambiguidade_da_ancora_textual_nao_e_recuperavel(self) -> None:
         # Saida presente, mas sem horarios abaixo: a falha NAO e de leitura de
@@ -675,7 +687,7 @@ class TestDiagnosticoGeometria(unittest.TestCase):
         )
         inclinada = _celulas_grade(
             y0=_Y_GRADE,
-            inclinacao=(3.0 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL),
+            inclinacao=(4.0 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL),
         )
         resultado = self._avaliar("modelo-1", inclinada, horarios)
         self.assertEqual(resultado.motivo, "deriva_alta")
@@ -990,3 +1002,454 @@ class TestMascaraLocalizadaModelos1E2(unittest.TestCase):
 
         self.assertTrue(analise.conflito)
         self.assertIn("regra=original", analise.detalhe or "")
+
+
+# ---------------------------------------------------------------------------
+# Modelo 1: ancora da faixa do mes (年 / 月份) no cartao chines sem quinzena
+# ---------------------------------------------------------------------------
+
+AVISO_FAIXA_MES = "ANCHOR_MONTH_BAND"
+
+# Tabela que comeca acima do cabecalho das colunas e inclui a faixa do mes.
+_TABELA_FM = [40.0, 60.0, 480.0, 760.0]
+_Y_DADOS_FM = 285.0
+_BASE_FAIXA = 220.0  # y2 da caixa "年月份" na foto reta
+_NOME_MANUSCRITO = "Anderson Rafael"
+
+
+def _textos_faixa_mes(
+    *,
+    faixa: bool = True,
+    cabecalho: bool = True,
+    dados: bool = True,
+    inclinacao: float = 0.0,
+    extra: tuple[tuple[str, list[float]], ...] = (),
+) -> list[tuple[str, list[float]]]:
+    """Cartao chines: nome, 单位, salario, titulo, faixa 年/月份, cabecalho, dados."""
+    textos: list[tuple[str, list[float]]] = [
+        (_NOME_MANUSCRITO, [100, 30, 300, 70]),
+        ("单位", [60, 75, 110, 100]),
+        ("日薪", [60, 105, 120, 125]),
+        ("考勤表", [180, 135, 340, 175]),
+    ]
+    if faixa:
+        textos.append(("年月份", [300, 190, 440, _BASE_FAIXA]))
+    if cabecalho:
+        textos += [
+            ("上午", [90, 232, 200, 252]),
+            ("下午", [210, 232, 320, 252]),
+            ("加班", [330, 232, 430, 252]),
+            ("日期上班下班", [60, 255, 200, 275]),
+        ]
+    if dados:
+        textos += _horarios_grade(_Y_DADOS_FM)
+    textos += list(extra)
+    if not inclinacao:
+        return textos
+    inclinados = []
+    for texto, (x1, y1, x2, y2) in textos:
+        desvio = inclinacao * ((x1 + x2) / 2 - _TABELA_FM[0])
+        inclinados.append((texto, [x1, y1 + desvio, x2, y2 + desvio]))
+    return inclinados
+
+
+def _extrair_fm(textos, modelo="modelo-1", celulas=None):
+    dados = _dados_ocr(textos, _TABELA_FM, celulas)
+    return detector._extrair(dados, 600, 900, modelo=modelo)
+
+
+def _avaliar_fm(textos, modelo="modelo-1"):
+    return ancoras.avaliar_faixa_mes(
+        modelo,
+        tabela=Caixa(*_TABELA_FM[:2], _TABELA_FM[2] - _TABELA_FM[0], _TABELA_FM[3] - _TABELA_FM[1]),
+        caixas_texto=_textos_caixas(textos),
+    )
+
+
+class TestModelo1FaixaDoMes(unittest.TestCase):
+    def test_fm01_faixa_em_branco_corta_logo_abaixo_dela(self) -> None:
+        textos = _textos_faixa_mes()
+        deteccao = _extrair_fm(textos)
+
+        assert deteccao.tabela is not None
+        assert deteccao.cabecalho is not None
+        self.assertEqual(deteccao.aviso_ancora, AVISO_FAIXA_MES)
+        # Abaixo da base da faixa e acima do centro de 上午/下午/加班 (242).
+        self.assertGreater(deteccao.tabela.y, _BASE_FAIXA)
+        self.assertLess(deteccao.tabela.y, 242.0)
+        self.assertEqual(deteccao.cabecalho.y2, deteccao.tabela.y)
+        # Nome, 单位, salario, titulo e a propria faixa ficam fora do recorte.
+        for caixa in deteccao.caixas_texto:
+            if caixa.texto in (_NOME_MANUSCRITO, "单位", "日薪", "考勤表", "年月份"):
+                self.assertLessEqual(caixa.y2, deteccao.tabela.y, caixa.texto)
+        # O cabecalho das colunas e os dados ficam dentro.
+        for caixa in deteccao.caixas_texto:
+            if caixa.texto in ("上午", "下午", "加班"):
+                self.assertGreater(caixa.y + caixa.altura / 2, deteccao.tabela.y)
+
+    def test_fm02_manuscrito_dentro_e_vazando_para_cima_nao_move_o_limite(self) -> None:
+        sem = _extrair_fm(_textos_faixa_mes())
+        com = _extrair_fm(
+            _textos_faixa_mes(
+                extra=(
+                    # "Setembro" invade o titulo; "9" fica dentro da faixa.
+                    ("Setembro", [330, 150, 420, 205]),
+                    ("9", [300, 195, 322, 216]),
+                )
+            )
+        )
+
+        assert sem.tabela is not None and com.tabela is not None
+        self.assertEqual(com.aviso_ancora, AVISO_FAIXA_MES)
+        self.assertEqual(com.tabela.y, sem.tabela.y)
+        for caixa in com.caixas_texto:
+            if caixa.texto in ("Setembro", "9"):
+                self.assertLessEqual(caixa.y2, com.tabela.y, caixa.texto)
+
+    def test_fm03_foto_inclinada_limite_entre_a_faixa_e_o_cabecalho(self) -> None:
+        for graus in (-4, -2, 2, 4):
+            inclinacao = math.tan(math.radians(graus))
+            textos = _textos_faixa_mes(inclinacao=inclinacao)
+            resultado = _avaliar_fm(textos)
+
+            self.assertEqual(resultado.motivo, "ok", graus)
+            assert resultado.ancora is not None
+            caixas = {t: Caixa(b[0], b[1], b[2] - b[0], b[3] - b[1]) for t, b in textos}
+            base = caixas["年月份"].y2
+            centros = [
+                caixas[t].y + caixas[t].altura / 2 for t in ("上午", "下午")
+            ]
+            self.assertGreater(resultado.ancora.y, base, graus)
+            self.assertLess(resultado.ancora.y, min(centros), graus)
+
+    def test_fm03_limite_que_cortaria_o_cabecalho_bloqueia(self) -> None:
+        # Caixa da faixa inflada (foto torta): a base passa do centro de 上午.
+        textos = _textos_faixa_mes()
+        textos = [
+            (t, [300, 190, 440, 250] if t == "年月份" else b) for t, b in textos
+        ]
+        resultado = _avaliar_fm(textos)
+        self.assertEqual(resultado.motivo, "limite_incerto")
+        self.assertTrue(resultado.bloqueia)
+
+        with self.assertRaises(detector.ErroDeteccao) as contexto:
+            _extrair_fm(textos)
+        self.assertEqual(contexto.exception.codigo, CodigoFalha.ANCHOR_NOT_CONFIDENT)
+        self.assertIn("faixa_mes=limite_incerto", contexto.exception.diagnostico)
+
+    def test_fm04_sem_faixa_cai_no_fallback_de_rotulos(self) -> None:
+        textos = [
+            ("考勤表", [180, 300, 340, 340]),
+            ("Dia", [60, 410, 110, 428]),
+            ("Entrada", [170, 410, 250, 428]),
+            ("Saida", [270, 410, 340, 428]),
+        ] + _horarios_grade(_Y_GRADE)
+        dados = _dados_ocr(textos, _TABELA, _celulas_grade(y0=_Y_GRADE))
+
+        deteccao = detector._extrair(dados, 600, 900, modelo="modelo-1")
+
+        self.assertEqual(deteccao.aviso_ancora, "ANCHOR_FALLBACK")
+        resultado = _avaliar_fm(textos)
+        self.assertEqual(resultado.motivo, "nao_encontrada")
+        self.assertFalse(resultado.bloqueia)
+
+    def test_fm05_duas_faixas_bloqueiam(self) -> None:
+        textos = _textos_faixa_mes(extra=(("月份", [300, 150, 440, 180]),))
+        resultado = _avaliar_fm(textos)
+        self.assertEqual(resultado.motivo, "ambigua")
+
+        with self.assertRaises(detector.ErroDeteccao) as contexto:
+            _extrair_fm(textos)
+        self.assertEqual(contexto.exception.codigo, CodigoFalha.ANCHOR_NOT_CONFIDENT)
+        self.assertIn("faixa_mes=ambigua", contexto.exception.diagnostico)
+
+    def test_fm05_rotulo_fora_da_regiao_da_tabela_bloqueia(self) -> None:
+        # "年月份" abaixo do cabecalho das colunas (nos dados) e ambiguo.
+        textos = _textos_faixa_mes(extra=(("年月份", [300, 600, 440, 630]),))
+        self.assertEqual(_avaliar_fm(textos).motivo, "ambigua")
+
+        # E fora do eixo horizontal da tabela.
+        textos = _textos_faixa_mes(extra=(("月份", [520, 190, 590, 220]),))
+        self.assertEqual(_avaliar_fm(textos).motivo, "ambigua")
+
+    def test_fm06_com_quinzena_resultado_identico(self) -> None:
+        base = [("1ª Quinzena", [60, 380, 300, 398])] + _horarios_grade(_Y_GRADE)
+        chines = [
+            t for t in _textos_faixa_mes(dados=False)
+        ] + base
+        celulas = _celulas_grade(y0=_Y_GRADE)
+        for modelo in ("modelo-1", "modelo-3"):
+            sem = detector._extrair(
+                _dados_ocr(base, _TABELA, celulas), 600, 900, modelo=modelo
+            )
+            com = detector._extrair(
+                _dados_ocr(chines, _TABELA, celulas), 600, 900, modelo=modelo
+            )
+            assert sem.tabela is not None and com.tabela is not None
+            self.assertIsNone(com.aviso_ancora, modelo)
+            self.assertEqual(com.tabela.y, sem.tabela.y, modelo)
+
+    def test_fm07_nunca_e_usada_em_outros_modelos(self) -> None:
+        textos = _textos_faixa_mes()
+        for modelo in ("modelo-2", "modelo-3", "modelo-4", "modelo-5", None):
+            resultado = _avaliar_fm(textos, modelo=modelo)
+            self.assertIsNone(resultado.ancora, modelo)
+            self.assertEqual(resultado.motivo, "nao_aplicavel", modelo)
+        for modelo in ("modelo-4", "modelo-5"):
+            deteccao = _extrair_fm(textos, modelo=modelo)
+            self.assertNotEqual(deteccao.aviso_ancora, AVISO_FAIXA_MES, modelo)
+        for modelo in ("modelo-2", "modelo-3"):
+            try:
+                deteccao = _extrair_fm(textos, modelo=modelo)
+            except detector.ErroDeteccao:
+                continue
+            self.assertNotEqual(deteccao.aviso_ancora, AVISO_FAIXA_MES, modelo)
+
+    def test_fm08_sem_cabecalho_ou_sem_dados_nao_usa_a_ancora(self) -> None:
+        sem_cabecalho = _avaliar_fm(_textos_faixa_mes(cabecalho=False))
+        self.assertEqual(sem_cabecalho.motivo, "sem_cabecalho")
+        self.assertFalse(sem_cabecalho.bloqueia)
+
+        sem_dados = _avaliar_fm(_textos_faixa_mes(dados=False))
+        self.assertEqual(sem_dados.motivo, "sem_cabecalho")
+
+        with self.assertRaises(detector.ErroDeteccao) as contexto:
+            _extrair_fm(_textos_faixa_mes(dados=False))
+        self.assertEqual(contexto.exception.codigo, CodigoFalha.ANCHOR_NOT_FOUND)
+        self.assertIn("faixa_mes=sem_cabecalho", contexto.exception.diagnostico)
+
+    def test_fm09_sem_contexto_chines_nao_se_aplica(self) -> None:
+        textos = [t for t in _textos_faixa_mes() if t[0] not in ("考勤表", "日期上班下班")]
+        self.assertEqual(_avaliar_fm(textos).motivo, "sem_contexto")
+
+    def test_fm10_faixa_lida_em_duas_caixas_vale_como_uma(self) -> None:
+        textos = [t for t in _textos_faixa_mes() if t[0] != "年月份"] + [
+            ("年", [300, 190, 330, 220]),
+            ("月份", [380, 190, 440, 220]),
+        ]
+        resultado = _avaliar_fm(textos)
+
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertEqual(resultado.metricas["faixas"], 1)
+
+    def test_fm11_ocr_errado_nos_rotulos_usa_caixa_curta_da_regiao(self) -> None:
+        textos = [
+            ("牛月伤" if t == "年月份" else t, b) for t, b in _textos_faixa_mes()
+        ]
+        resultado = _avaliar_fm(textos)
+
+        self.assertEqual(resultado.motivo, "ok")
+        assert resultado.ancora is not None
+        self.assertGreater(resultado.ancora.y, _BASE_FAIXA)
+
+    def test_fm12_linha_horizontal_abaixo_da_faixa_define_o_limite(self) -> None:
+        resultado = ancoras.avaliar_faixa_mes(
+            "modelo-1",
+            tabela=Caixa(40, 60, 440, 700),
+            caixas_texto=_textos_caixas(_textos_faixa_mes()),
+            linhas=(180.0, _BASE_FAIXA + 4.0, 260.0),
+        )
+
+        assert resultado.ancora is not None
+        self.assertEqual(resultado.ancora.y, _BASE_FAIXA + 5.0)
+
+    def test_fm13_diagnostico_nao_contem_texto_lido(self) -> None:
+        with self.assertRaises(detector.ErroDeteccao) as contexto:
+            _extrair_fm(_textos_faixa_mes(dados=False))
+        diagnostico = contexto.exception.diagnostico or ""
+        for proibido in (_NOME_MANUSCRITO, "单位", "考勤表", "年月份"):
+            self.assertNotIn(proibido, diagnostico)
+        self.assertIn("dist_cabecalho_alturas=", diagnostico)
+
+
+class TestAncoraDispensaConflitoInterno(unittest.TestCase):
+    """Corte decidido por ancora: sem segunda validacao de campo sensivel."""
+
+    def _deteccao(self, ancorada: bool, texto: str = "Empregado: JOAO"):
+        deteccao = deteccao_sintetica(
+            caixas_tabela=(Caixa(500, TOPO_TABELA + 100, 150, 18, texto=texto),)
+        )
+        return replace(deteccao, ancorada=ancorada)
+
+    def test_modelos_1_2_e_3_ancorados_nao_bloqueiam_nem_redigem(self) -> None:
+        for modelo in ("modelo-1", "modelo-2", "modelo-3"):
+            analise = validacao.analisar_sensiveis(
+                self._deteccao(True), modelo=modelo
+            )
+            self.assertFalse(analise.conflito, modelo)
+            self.assertEqual(analise.redigir, (), modelo)
+
+    def test_sem_ancora_continua_bloqueando(self) -> None:
+        for modelo in ("modelo-1", "modelo-2", "modelo-3"):
+            analise = validacao.analisar_sensiveis(
+                self._deteccao(False), modelo=modelo
+            )
+            self.assertTrue(analise.conflito, modelo)
+
+    def test_modelos_4_e_5_nao_sao_afetados(self) -> None:
+        for modelo in ("modelo-4", "modelo-5", None):
+            analise = validacao.analisar_sensiveis(
+                self._deteccao(True), modelo=modelo
+            )
+            self.assertTrue(analise.conflito, modelo)
+
+    def test_sobra_de_cabecalho_na_linha_de_corte_continua_sendo_redigida(self) -> None:
+        sobra = Caixa(160, TOPO_TABELA - 12, 80, 30, texto="JOAO DA SILVA")
+        deteccao = replace(
+            deteccao_sintetica(caixas_tabela=(sobra,)), ancorada=True
+        )
+
+        analise = validacao.analisar_sensiveis(deteccao, modelo="modelo-1")
+
+        self.assertFalse(analise.conflito)
+        self.assertIn(sobra, analise.redigir)
+
+    def test_carimbo_lido_como_numero_colado_com_quinzena_nao_bloqueia(self) -> None:
+        # Caso real (Alisson): o OCR cola os carimbos de horario em numeros que
+        # a regra tomava por CPF; a faixa "2 Quinzena" ja ancorou o recorte.
+        carimbo = "81306801347"
+        self.assertEqual(validacao.classificar_texto(carimbo), "sensivel")
+        textos = [
+            ("2° Quinzena", [60, 380, 300, 398]),
+            (carimbo, [70, 450, 150, 468]),
+        ] + _horarios_grade(_Y_GRADE)
+        celulas = _celulas_grade(y0=_Y_GRADE)
+
+        for modelo in ("modelo-1", "modelo-3"):
+            deteccao = detector._extrair(
+                _dados_ocr(textos, _TABELA, celulas), 600, 900, modelo=modelo
+            )
+            self.assertTrue(deteccao.ancorada, modelo)
+            analise = validacao.analisar_sensiveis(deteccao, modelo=modelo)
+            self.assertFalse(analise.conflito, modelo)
+
+    def test_ancorada_so_quando_ha_ancora_do_modelo(self) -> None:
+        textos = [("1ª Quinzena", [60, 380, 300, 398])] + _horarios_grade(_Y_GRADE)
+        dados = _dados_ocr(textos, _TABELA, _celulas_grade(y0=_Y_GRADE))
+
+        for modelo in ("modelo-1", "modelo-3"):
+            self.assertTrue(
+                detector._extrair(dados, 600, 900, modelo=modelo).ancorada, modelo
+            )
+        for modelo in ("modelo-4", "modelo-5", None):
+            self.assertFalse(
+                detector._extrair(dados, 600, 900, modelo=modelo).ancorada, modelo
+            )
+
+    def test_faixa_do_mes_tambem_conta_como_ancora(self) -> None:
+        deteccao = _extrair_fm(_textos_faixa_mes())
+
+        self.assertEqual(deteccao.aviso_ancora, AVISO_FAIXA_MES)
+        self.assertTrue(deteccao.ancorada)
+
+
+class TestDerivaModelo1(unittest.TestCase):
+    def _avaliar(self, modelo: str):
+        # Deriva ~2.0 alturas (0.75 x 2.7): entre 1.5 e 2.5.
+        inclinacao = (2.7 * _ALTURA_CEL) / (_COLUNAS * _LARGURA_CEL)
+        return ancoras.avaliar_geometria(
+            modelo,
+            tabela=Caixa(40, 100, 440, 660),
+            caixas_texto=_textos_caixas(_horarios_grade(_Y_GRADE)),
+            celulas=_celulas_tabela(_celulas_grade(y0=_Y_GRADE, inclinacao=inclinacao)),
+        )
+
+    def test_modelo1_aceita_deriva_ate_2_5_alturas(self) -> None:
+        resultado = self._avaliar("modelo-1")
+
+        self.assertEqual(resultado.motivo, "ok")
+        self.assertGreater(resultado.metricas["deriva_alturas"], 1.5)
+
+    def test_modelo2_continua_com_limite_de_1_5(self) -> None:
+        resultado = self._avaliar("modelo-2")
+
+        self.assertEqual(resultado.motivo, "deriva_alta")
+
+
+class TestMascaraColunasDireitaModelo2(unittest.TestCase):
+    """Modelo 2: so ate a Saida final; Hora Extra e Assinatura sao mascaradas."""
+
+    def _deteccao(self):
+        topo = TOPO_TABELA
+        rotulos = (
+            # a fixture base ja traz Entrada (160) e Saida (310)
+            Caixa(380, topo + 8, 60, 18, texto="Entrada"),
+            Caixa(460, topo + 8, 50, 18, texto="Saida"),
+            Caixa(560, topo + 8, 60, 18, texto="Entrada"),
+            Caixa(670, topo + 8, 50, 18, texto="Saida"),
+            Caixa(790, topo + 8, 90, 18, texto="Assinatura"),
+        )
+        dados = (
+            Caixa(460, topo + 60, 60, 20, texto="17:08"),
+            Caixa(120, topo + 60, 60, 20, texto="08:00"),
+        )
+        base = deteccao_sintetica(caixas_tabela=rotulos + dados)
+        return replace(base, ancorada=True)
+
+    def test_mascara_comeca_depois_da_saida_final(self) -> None:
+        deteccao = self._deteccao()
+        mascaras = validacao.mascara_colunas_direita_modelo2(deteccao)
+
+        self.assertTrue(mascaras)
+        x_corte = min(m.x for m in mascaras)
+        self.assertGreater(x_corte, 510)  # horarios da Saida final preservados
+        self.assertLessEqual(x_corte, 560)
+
+    def test_analise_inclui_mascara_so_no_modelo2_ancorado(self) -> None:
+        deteccao = self._deteccao()
+        analise = validacao.analisar_sensiveis(deteccao, modelo="modelo-2")
+        self.assertTrue(any(m.x > 510 for m in analise.redigir))
+        outro = validacao.analisar_sensiveis(deteccao, modelo="modelo-3")
+        self.assertFalse(any(m.x > 510 for m in outro.redigir))
+
+    def test_sem_rotulos_nao_mascara(self) -> None:
+        deteccao = replace(deteccao_sintetica(), ancorada=True)
+        self.assertEqual(validacao.mascara_colunas_direita_modelo2(deteccao), ())
+
+
+class TestMascaraAssinaturasModelo5(unittest.TestCase):
+    """Modelo 5: assinaturas de ENTRADA e SAIDA mascaradas, horas preservadas."""
+
+    def _deteccao(self):
+        topo = TOPO_TABELA
+        caixas = [
+            Caixa(266, topo + 8, 90, 24, texto="ASSINATURA"),
+            Caixa(413, topo + 10, 57, 24, texto="HORAS"),
+            Caixa(532, topo + 8, 90, 24, texto="ASSINATURA"),
+            Caixa(680, topo + 10, 66, 24, texto="HORAS"),
+        ]
+        for i in range(10):
+            y = topo + 50 + i * 35
+            caixas += [
+                Caixa(98, y, 110, 28, texto="020926"),
+                Caixa(223, y, 140, 28, texto="nome"),
+                Caixa(405, y, 75, 26, texto="08:06"),
+                Caixa(510, y, 140, 28, texto="nome"),
+                Caixa(676, y, 80, 26, texto="12:07"),
+            ]
+        return deteccao_sintetica(caixas_tabela=tuple(caixas))
+
+    def test_mascara_as_duas_assinaturas_e_preserva_datas_e_horas(self) -> None:
+        mascaras = validacao.mascara_assinaturas_modelo5(self._deteccao())
+
+        self.assertTrue(mascaras)
+        for horario in ((405, 480), (676, 756), (98, 208)):
+            self.assertFalse(
+                any(m.x < horario[1] and m.x2 > horario[0] for m in mascaras),
+                horario,
+            )
+        self.assertTrue(any(m.x <= 223 and m.x2 >= 363 for m in mascaras))
+        self.assertTrue(any(m.x <= 510 and m.x2 >= 650 for m in mascaras))
+
+    def test_analise_aplica_so_no_modelo5(self) -> None:
+        deteccao = self._deteccao()
+        self.assertTrue(
+            validacao.analisar_sensiveis(deteccao, modelo="modelo-5").redigir
+        )
+        outro = validacao.analisar_sensiveis(deteccao, modelo="modelo-4").redigir
+        self.assertFalse(any(m.altura == 40.0 for m in outro))
+
+    def test_sem_rotulos_nao_mascara(self) -> None:
+        self.assertEqual(
+            validacao.mascara_assinaturas_modelo5(deteccao_sintetica()), ()
+        )
