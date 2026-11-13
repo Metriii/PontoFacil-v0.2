@@ -13,7 +13,8 @@ Excel, usando o **MCP do PaddleOCR** (modelo `PaddleOCR-VL-1.6` via AI Studio).
    e gera `folha_presenca.xlsx`.
 
 > Esses dois scripts são **exclusivos do Modelo 1**
-> (`/processamento/modelo-1`); os modelos 2, 3 e 4 têm módulos próprios em `backend/modelo2/`, `backend/modelo3/` e `backend/modelo4/`.
+> (`/processamento/modelo-1`); os modelos 2, 3, 4 e 5 têm módulos próprios em
+> `backend/modelo2/`, `backend/modelo3/`, `backend/modelo4/` e `backend/modelo5/`.
 > Regra do Modelo 1: entrada lida entre 20h e 23h vira 08h
 > preservando os minutos (`20:30` → `08:30`).
 
@@ -34,6 +35,56 @@ camada local `backend/anonimizacao/`:
 O modo é **fail closed**: se a tabela/cabeçalho não puderem ser separados com
 segurança, o arquivo não segue para o OCR externo. A imagem original nunca é
 usada como fallback.
+
+### O que é ocultado em cada modelo (v0.2)
+
+O recorte começa numa **âncora** própria de cada modelo. Tudo acima dela
+(empresa, nome, CPF, título) é descartado. As colunas de assinatura são
+cobertas de branco.
+
+| Modelo | Âncora do recorte (e alternativas) | Máscara extra |
+|---|---|---|
+| 1 – Listra Azul | faixa `1ª/2ª Quinzena` → faixa do mês `年/月份` do cartão chinês (`ANCHOR_MONTH_BAND`) → rótulos de coluna (`ANCHOR_FALLBACK`) → geometria da grade (`ANCHOR_GEOMETRIC`) | — |
+| 2 – Padrão | linha com `Saída` → geometria → rótulos de coluna (`ANCHOR_FALLBACK`) | colunas **Hora Extra** e **Assinatura**, à direita da Saída final |
+| 3 – Listra Verde | faixa `1ª/2ª Quinzena` → rótulos de coluna | — |
+| 4 – Simples | caminho genérico | — |
+| 5 – Caderno | logo abaixo da faixa `REGISTRO DE PONTO`, pelos rótulos impressos (`LAYOUT_LABELS`) | colunas **ASSINATURA** de entrada e de saída |
+
+Outras regras desta versão:
+
+- **Modelo 1:** se a primeira passada não acha a tabela, o layout é refeito com
+  `layout_threshold=0.3`. O limite de deriva da geometria é 2,5 (nos demais, 1,5).
+- **Modelos 1, 2 e 3:** com o corte decidido por uma âncora, a segunda
+  validação de campo sensível dentro da tabela é dispensada. Carimbos de
+  horário lidos como números longos bloqueavam folhas boas.
+- **Modelo 5:** a tabela é derivada dos rótulos `ENTRADA`/`SAÍDA`/`ASSINATURA`/`HORAS`,
+  inclusive lidos tortos (`BAIDA`, `ARBINATURA`, `HORAB`). A borda direita
+  para na última coluna `HORAS`, o que deixa de fora a página vizinha do caderno.
+- O aviso da âncora aparece no log (`aviso=...`) e o motivo de cada bloqueio
+  em `diag=...`.
+- A prévia humana (aprovar/rejeitar) continua obrigatória antes do MCP.
+
+Detalhes em [`docs/ANCORAS_POR_MODELO.md`](docs/ANCORAS_POR_MODELO.md).
+
+### Leitura do Modelo 5 (caderno, duas linhas por data)
+
+Cada data ocupa duas linhas: a **1ª** traz a entrada e a saída da **manhã**,
+e a **2ª** a volta e a saída da **tarde**. O parser (`backend/modelo5/`) pareia
+as linhas pela data lida e, quando ela falha, pela ordem e pelo turno: a última
+batida a partir de 14:30 é tarde. Também corrige leituras típicas do OCR no
+caderno:
+
+| OCR leu | Vira |
+|---|---|
+| `D2`, `D10` (zero lido como letra) | `02`, `10` |
+| `08%` + `00` (traço da coluna HORAS) | `08:00` |
+| `08800` (dois-pontos lido como `8`) | `08:00`, marcado para revisão |
+| anos diferentes na coluna Nº | ano mais frequente |
+| datas deslocadas uma linha | corrigidas pela ordem, marcadas para revisão |
+
+Quando o OCR troca um dígito do horário, o parser não adivinha: o dia sai
+sinalizado para revisão. Foto escura ou desfocada continua sendo recusada.
+Mais em [`docs/PROCESSO_MODELO_5.md`](docs/PROCESSO_MODELO_5.md).
 
 A resposta de `/processar` ganhou o campo compatível
 `bloqueadas_anonimizacao`, com a quantidade de arquivos barrados nessa etapa.
@@ -220,6 +271,7 @@ backend/modelo1/
 
 backend/anonimizacao/
 ├── detector.py     # PP-StructureV3 local + geometria da tabela
+├── ancoras.py      # ancoras de recorte por modelo (quinzena, Saida, faixa do mes, grade)
 ├── recorte.py      # recorte, redacao e deskew
 ├── validacao.py    # campos sensiveis, integridade e cabecalho
 ├── metadados.py    # regrava PNG sem EXIF
