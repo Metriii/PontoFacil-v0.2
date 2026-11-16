@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .. import auditoria, autenticacao, config, seguranca, usuarios
+from .. import auditoria, autenticacao, config, logs, seguranca, usuarios
 
 router = APIRouter(tags=["autenticacao"], prefix="/auth")
 
@@ -120,6 +120,7 @@ def verificar(
         _auditar(email, "auth_codigo", "failed", exc.mensagem)
         raise _erro(exc) from exc
 
+    logs.definir_usuario(str(usuario.get("nome") or usuario.get("email") or ""))
     _auditar(str(usuario["email"]), "auth_codigo", "success")
     _limpar_cookie_desafio(response)
     _definir_cookie_sessao(response, sessao)

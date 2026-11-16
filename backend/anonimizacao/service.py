@@ -106,6 +106,10 @@ def _anonimizar_sync(
     except recorte.ErroRecorte as exc:
         raise ErroAnon(CodigoFalha.CROP_OUT_OF_BOUNDS, str(exc)) from exc
 
+    caixa_recorte = validacao.ajustar_topo_recorte(
+        deteccao, caixa_recorte, analise.redigir
+    )
+
     checagem = validacao.validar_recorte(
         deteccao, caixa_recorte, analise.redigir
     )
@@ -188,7 +192,7 @@ async def _processar_uma(
     except asyncio.TimeoutError:
         logs.warning(
             "Anonimizacao",
-            f"Timeout ao anonimizar imagem (id={id_opaco})",
+            f"Timeout ao anonimizar imagem {nome} (id={id_opaco})",
             lote,
         )
         return ResultadoAnonimizacao.bloqueado(
@@ -200,7 +204,7 @@ async def _processar_uma(
     except ErroAnon as exc:
         logs.warning(
             "Anonimizacao",
-            f"Imagem bloqueada (id={id_opaco}, modelo={modelo or '-'}): "
+            f"Imagem bloqueada: {nome} (id={id_opaco}, modelo={modelo or '-'}): "
             f"{exc.codigo.value} | {exc.mensagem}"
             + (f" | {exc.diagnostico}" if exc.diagnostico else ""),
             lote,
@@ -215,7 +219,7 @@ async def _processar_uma(
     except detector.ErroDeteccao as exc:
         logs.warning(
             "Anonimizacao",
-            f"Detector indisponível (id={id_opaco}): {exc.codigo.value}; "
+            f"Detector indisponível para {nome} (id={id_opaco}): {exc.codigo.value}; "
             "imagem aguarda tratamento manual.",
             lote,
         )
@@ -231,7 +235,7 @@ async def _processar_uma(
     except Exception as exc:  # noqa: BLE001
         logs.error(
             "Anonimizacao",
-            f"Erro inesperado (id={id_opaco}): {type(exc).__name__}",
+            f"Erro inesperado em {nome} (id={id_opaco}): {type(exc).__name__}",
             lote,
         )
         return ResultadoAnonimizacao.erro(
@@ -244,7 +248,7 @@ async def _processar_uma(
     duracao = time.monotonic() - inicio
     logs.info(
         "Anonimizacao",
-        f"Imagem aprovada em {duracao:.2f}s (id={id_opaco}, "
+        f"Imagem aprovada em {duracao:.2f}s: {nome} (id={id_opaco}, "
         f"modelo={modelo or '-'}, aviso={resultado.aviso_ancora or '-'}, "
         f"{len(resultado.artefato or b'')} bytes)",
         lote,
@@ -266,6 +270,14 @@ async def processar_lote(
     if not imagens:
         return []
 
+    inicio = time.monotonic()
+    logs.info(
+        "Anonimizacao",
+        f"OCR local iniciado: {len(imagens)} imagem(ns), "
+        f"modelo={modelo or '-'}",
+        lote,
+    )
+
     semaforo = asyncio.Semaphore(config.ANON_CONCORRENCIA)
     tarefas = [
         asyncio.create_task(
@@ -280,4 +292,52 @@ async def processar_lote(
         )
         for nome, dados in imagens
     ]
-    return list(await asyncio.gather(*tarefas))
+    resultados = list(await asyncio.gather(*tarefas))
+    _registrar_resumo(resultados, lote, time.monotonic() - inicio)
+    return resultados
+
+
+_LIMITE_LINHA_RESUMO = 900
+
+
+def _em_linhas(titulo: str, itens: list[str]) -> list[str]:
+    """Quebra a lista em linhas que cabem no limite de uma entrada de log."""
+    linhas: list[str] = []
+    atual: list[str] = []
+    for item in itens:
+        candidato = ", ".join([*atual, item])
+        if atual and len(titulo) + len(candidato) > _LIMITE_LINHA_RESUMO:
+            linhas.append(titulo + ", ".join(atual))
+            atual = []
+        atual.append(item)
+    if atual:
+        linhas.append(titulo + ", ".join(atual))
+    return linhas
+
+
+def _registrar_resumo(
+    resultados: list[ResultadoAnonimizacao],
+    lote: str | None,
+    duracao: float,
+) -> None:
+    processadas = [
+        r.nome_original
+        for r in resultados
+        if r.status == StatusAnonimizacao.APPROVED
+    ]
+    nao_processadas = [
+        f"{r.nome_original} ({r.codigo_falha.value if r.codigo_falha else r.status.value})"
+        for r in resultados
+        if r.status != StatusAnonimizacao.APPROVED
+    ]
+    logs.info(
+        "Anonimizacao",
+        f"OCR local concluido em {duracao:.2f}s: "
+        f"{len(processadas)} processada(s), "
+        f"{len(nao_processadas)} nao processada(s)",
+        lote,
+    )
+    for linha in _em_linhas("Processadas: ", processadas):
+        logs.info("Anonimizacao", linha, lote)
+    for linha in _em_linhas("Nao processadas: ", nao_processadas):
+        logs.warning("Anonimizacao", linha, lote)

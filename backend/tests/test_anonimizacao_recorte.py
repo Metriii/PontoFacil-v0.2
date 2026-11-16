@@ -60,6 +60,76 @@ class TestRecorte(unittest.TestCase):
         self.assertLess(antes, 250)
         self.assertGreater(depois, 245)
 
+    def _deteccao_com_texto_acima(self, y2_texto: float):
+        from backend.anonimizacao.schemas import DeteccaoEstrutural
+
+        tabela = Caixa(100, 500, 600, 700)
+        cabecalho = Caixa(0, 0, 900, 500)
+        texto = Caixa(150, y2_texto - 30, 500, 30, texto="Nos termos da portaria")
+        deteccao = DeteccaoEstrutural(
+            largura=900,
+            altura=1400,
+            tabela=tabela,
+            cabecalho=cabecalho,
+            caixas_texto=(texto,),
+        )
+        caixa = recorte.calcular_recorte(
+            tabela, 900, 1400, margem=6, cabecalho=cabecalho
+        )
+        return deteccao, caixa
+
+    def test_ajuste_topo_tira_texto_que_invade_poucos_pixels(self) -> None:
+        # Foto inclinada: linha acima da tabela termina 1px dentro do recorte.
+        deteccao, caixa = self._deteccao_com_texto_acima(501.4)
+        self.assertFalse(validacao.validar_recorte(deteccao, caixa).ok)
+
+        ajustada = validacao.ajustar_topo_recorte(deteccao, caixa)
+
+        self.assertEqual(ajustada.y, 502)
+        self.assertEqual(ajustada.y2, caixa.y2)
+        self.assertTrue(validacao.validar_recorte(deteccao, ajustada).ok)
+
+    def test_ajuste_topo_mantem_tabela_e_ignora_texto_da_tabela(self) -> None:
+        from backend.anonimizacao.schemas import DeteccaoEstrutural
+
+        tabela = Caixa(100, 500, 600, 700)
+        cabecalho = Caixa(0, 0, 900, 500)
+        caixa = recorte.calcular_recorte(
+            tabela, 900, 1400, margem=6, cabecalho=cabecalho
+        )
+        # Pior caso da regra de cabecalho (y2 = tabela.y + 2): o topo desce
+        # no maximo 2px e a tabela continua dentro da tolerancia.
+        no_limite = DeteccaoEstrutural(
+            largura=900, altura=1400, tabela=tabela, cabecalho=cabecalho,
+            caixas_texto=(Caixa(150, 470, 500, 32, texto="cabecalho"),),
+        )
+        ajustada = validacao.ajustar_topo_recorte(no_limite, caixa)
+        self.assertEqual(ajustada.y, 502)
+        self.assertTrue(ajustada.contem(tabela, tolerancia=4))
+        self.assertTrue(validacao.validar_recorte(no_limite, ajustada).ok)
+
+        # Texto que termina dentro da tabela (rotulo de coluna) nao move nada.
+        dentro = DeteccaoEstrutural(
+            largura=900, altura=1400, tabela=tabela, cabecalho=cabecalho,
+            caixas_texto=(Caixa(150, 495, 500, 30, texto="Entrada"),),
+        )
+        self.assertIs(validacao.ajustar_topo_recorte(dentro, caixa), caixa)
+
+        # Caixa ja redigida e ignorada (ela e pintada de branco depois).
+        redigida = Caixa(150, 471, 500, 30, texto="nome")
+        com_redigida = DeteccaoEstrutural(
+            largura=900, altura=1400, tabela=tabela, cabecalho=cabecalho,
+            caixas_texto=(redigida,),
+        )
+        self.assertIs(
+            validacao.ajustar_topo_recorte(com_redigida, caixa, (redigida,)),
+            caixa,
+        )
+
+    def test_ajuste_topo_mantem_recorte_sem_invasao(self) -> None:
+        deteccao, caixa = self._deteccao_com_texto_acima(480.0)
+        self.assertIs(validacao.ajustar_topo_recorte(deteccao, caixa), caixa)
+
     def test_validar_saida_rejeita_bytes_invalidos(self) -> None:
         resultado = validacao.validar_saida(b"nao e imagem")
         self.assertFalse(resultado.ok)

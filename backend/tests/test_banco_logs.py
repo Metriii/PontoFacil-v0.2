@@ -362,16 +362,54 @@ class TestLogsDiarios(BaseTemporaria):
         linhas = self._arquivo_log().read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(len(linhas), 2)
-        self.assertIn(" | INFO | Teste | primeira entrada | lote=lote-1", linhas[0])
-        self.assertIn(" | WARNING | Teste | segunda entrada", linhas[1])
+        self.assertIn(
+            " | Sistema | INFO | Teste | primeira entrada | lote=lote-1", linhas[0]
+        )
+        self.assertIn(" | Sistema | WARNING | Teste | segunda entrada", linhas[1])
         self.assertFalse(linhas[1].endswith("|"))
 
     def test_sanitiza_quebras_e_separadores(self) -> None:
         logs.error("Componente|Falso", "linha1\nlinha2 | INFO | injetado")
         linha = self._arquivo_log().read_text(encoding="utf-8")
         self.assertNotIn("\n", linha.strip())
-        self.assertEqual(linha.count(" | "), 3)
+        self.assertEqual(linha.count(" | "), 4)
         self.assertIn("linha1 linha2 / INFO / injetado", linha)
+
+    def test_usuario_vem_logo_depois_do_horario(self) -> None:
+        token = logs.iniciar_contexto()
+        try:
+            logs.definir_usuario("Vinicius")
+            logs.info("OCR", "com usuario", modelo="modelo-1")
+        finally:
+            logs.encerrar_contexto(token)
+        logs.info("Startup", "sem usuario")
+        linhas = self._arquivo_log().read_text(encoding="utf-8").splitlines()
+
+        self.assertRegex(
+            linhas[0],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| Vinicius \| INFO \| OCR "
+            r"\| Modelo: modelo-1 \| com usuario$",
+        )
+        self.assertIn(" | Sistema | INFO | Startup | sem usuario", linhas[1])
+
+    def test_usuario_do_contexto_chega_em_threads_e_tarefas(self) -> None:
+        import asyncio
+
+        async def fluxo() -> None:
+            token = logs.iniciar_contexto()
+            try:
+                # Como na dependencia do FastAPI: definido dentro de uma thread.
+                await asyncio.to_thread(logs.definir_usuario, "Ana")
+                await asyncio.to_thread(logs.info, "Anon", "na thread")
+                await asyncio.create_task(asyncio.sleep(0))
+                logs.info("Anon", "no loop")
+            finally:
+                logs.encerrar_contexto(token)
+
+        asyncio.run(fluxo())
+        texto = self._arquivo_log().read_text(encoding="utf-8")
+        self.assertIn(" | Ana | INFO | Anon | na thread", texto)
+        self.assertIn(" | Ana | INFO | Anon | no loop", texto)
 
     def test_falha_de_escrita_nao_propaga(self) -> None:
         arquivo = Path(self._tmp.name) / "logs-como-arquivo"

@@ -121,6 +121,18 @@ export function RevisaoAnonimizacaoDialog({
 
   const estaProcessando = (id: string) => processando.has(id);
 
+  // "Selecionar todas" e uma acao explicita do usuario: so marca as imagens
+  // aprovadas que nao estao em reprocessamento.
+  const selecionaveis = aprovadas
+    .filter((item) => item.id && !processando.has(item.id))
+    .map((item) => item.id);
+  const todasMarcadas =
+    selecionaveis.length > 0 && selecionaveis.every((id) => selecionados.has(id));
+
+  const alternarTodas = () => {
+    setSelecionados(todasMarcadas ? new Set() : new Set(selecionaveis));
+  };
+
   const executarAcao = useCallback(async (id: string, acao: AcaoItem) => {
     setProcessando((atual) => new Set([...atual, id]));
     try {
@@ -173,6 +185,23 @@ export function RevisaoAnonimizacaoDialog({
             cada prévia e confirme visualmente antes de continuar.
           </p>
         </div>
+
+        {aprovadas.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-sm text-muted-foreground">
+              {selecionados.size} de {aprovadas.length} selecionada(s)
+            </span>
+            <button
+              type="button"
+              onClick={alternarTodas}
+              disabled={enviando || selecionaveis.length === 0}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-primary px-3 py-1.5 text-sm font-medium text-primary transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+              {todasMarcadas ? "Desmarcar todas" : "Selecionar todas"}
+            </button>
+          </div>
+        )}
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
           {

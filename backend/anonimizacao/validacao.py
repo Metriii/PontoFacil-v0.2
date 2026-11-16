@@ -8,6 +8,7 @@ pessoal acima da tabela e sempre descartado.
 from __future__ import annotations
 
 import io
+import math
 import re
 import unicodedata
 
@@ -608,6 +609,48 @@ def analisar_sensiveis(
         conflito=conflitou,
         motivo=motivo,
         detalhe=detalhe,
+    )
+
+
+_TOLERANCIA_TOPO_TABELA_PX = 4.0  # mesma tolerancia de ``validar_recorte``
+
+
+def ajustar_topo_recorte(
+    deteccao: DeteccaoEstrutural,
+    recorte: Caixa,
+    redigidas: tuple[Caixa, ...] | list[Caixa] = (),
+) -> Caixa:
+    """Desce o topo do recorte para fora de texto do cabecalho que o invade.
+
+    Em fotos inclinadas, a ultima linha acima da tabela pode terminar poucos
+    pixels abaixo do topo detectado da tabela. Se excluir essa linha exige
+    descer o topo no maximo ``_TOLERANCIA_TOPO_TABELA_PX`` abaixo da tabela, o
+    recorte e ajustado. Caso contrario, ele volta inalterado e
+    ``validar_recorte`` bloqueia a imagem como antes. Recortes sem invasao
+    tambem voltam inalterados.
+    """
+    tabela = deteccao.tabela
+    if tabela is None:
+        return recorte
+
+    redigidas_chaves = {_chave_caixa(caixa) for caixa in redigidas}
+    topo = recorte.y
+    for caixa in deteccao.caixas_texto:
+        if not caixa.texto or _chave_caixa(caixa) in redigidas_chaves:
+            continue
+        # Mesmo criterio de ``validar_recorte`` para texto de cabecalho.
+        if caixa.y2 <= tabela.y + 2 and recorte.intersecta(caixa):
+            topo = max(topo, float(math.ceil(caixa.y2)))
+
+    if topo <= recorte.y or topo > tabela.y + _TOLERANCIA_TOPO_TABELA_PX:
+        return recorte
+    if recorte.y2 - topo < 32:
+        return recorte
+    return Caixa(
+        x=recorte.x,
+        y=topo,
+        largura=recorte.largura,
+        altura=recorte.y2 - topo,
     )
 
 

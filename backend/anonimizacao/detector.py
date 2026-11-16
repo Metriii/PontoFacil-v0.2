@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import unicodedata
 from io import BytesIO
 from typing import Any
@@ -88,6 +89,13 @@ def _carregar_modelo() -> Any:
         except Exception:  # noqa: BLE001 - configuracao opcional
             pass
 
+        from .. import logs
+
+        logs.info(
+            "Anonimizacao",
+            "Carregando modelo local do OCR (PP-StructureV3)...",
+        )
+        inicio_carga = time.monotonic()
         try:
             try:
                 _modelo = PPStructureV3(**kwargs)
@@ -102,10 +110,18 @@ def _carregar_modelo() -> Any:
                 except TypeError:
                     _modelo = PPStructureV3()
         except Exception as exc:  # noqa: BLE001
+            logs.error(
+                "Anonimizacao",
+                f"Falha ao carregar o modelo local do OCR: {type(exc).__name__}",
+            )
             raise ErroDeteccao(
                 CodigoFalha.STRUCTURE_MODEL_ERROR,
                 f"Falha ao carregar o PP-StructureV3: {type(exc).__name__}.",
             ) from exc
+        logs.info(
+            "Anonimizacao",
+            f"Modelo local do OCR carregado em {time.monotonic() - inicio_carga:.1f}s",
+        )
 
         try:
             import paddleocr

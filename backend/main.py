@@ -80,6 +80,16 @@ app.include_router(admin_usuarios.router, dependencies=_ROTAS_PROTEGIDAS)
 
 
 @app.middleware("http")
+async def _contexto_log(request, call_next):
+    """Isola o usuario dos logs por requisicao (ver ``logs.definir_usuario``)."""
+    token = logs.iniciar_contexto()
+    try:
+        return await call_next(request)
+    finally:
+        logs.encerrar_contexto(token)
+
+
+@app.middleware("http")
 async def _cabecalhos_seguranca(request, call_next):
     """Headers basicos de endurecimento para a API."""
     resposta = await call_next(request)

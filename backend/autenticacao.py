@@ -646,6 +646,7 @@ def usuario_atual(request: Request) -> dict[str, object]:
         raise HTTPException(
             status_code=401, detail="Sessao invalida ou expirada. Entre novamente."
         )
+    logs.definir_usuario(str(usuario.get("nome") or usuario.get("email") or ""))
     return {**usuario, "sessao_token": token}
 
 

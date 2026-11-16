@@ -2,10 +2,15 @@
 
 Todas as entradas sao gravadas em ``logs/YYYY-MM-DD.txt`` no fuso configurado.
 Falhas de escrita nunca interrompem o processamento principal.
+
+Formato: ``data hora | usuario | NIVEL | componente | [Modelo: x |] mensagem``.
+O usuario vem do contexto da requisicao (ver ``definir_usuario``); entradas
+fora de uma requisicao autenticada saem como ``Sistema``.
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 import threading
@@ -19,6 +24,43 @@ _LIMITE_MENSAGEM = 1000
 _LOCK = threading.Lock()
 _LOG = logging.getLogger("pontofacil.logs")
 _TZ_FALLBACK = timezone(timedelta(hours=-3), "America/Sao_Paulo")
+
+USUARIO_SISTEMA = "Sistema"
+
+# Cada requisicao recebe um dicionario proprio (``iniciar_contexto``). Como as
+# copias de contexto (threadpool do FastAPI, ``asyncio.to_thread``,
+# ``create_task``) compartilham a mesma referencia, o nome definido pela
+# dependencia de autenticacao fica visivel em todo o processamento da
+# requisicao, inclusive em tarefas de fundo disparadas por ela.
+_contexto: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "pontofacil_log_usuario", default=None
+)
+
+
+def iniciar_contexto() -> contextvars.Token:
+    """Abre o contexto de log de uma requisicao (chamado pelo middleware)."""
+    return _contexto.set({})
+
+
+def encerrar_contexto(token: contextvars.Token) -> None:
+    _contexto.reset(token)
+
+
+def definir_usuario(nome: str | None) -> None:
+    """Registra o usuario autenticado para os logs da requisicao atual."""
+    nome = (nome or "").strip()
+    if not nome:
+        return
+    atual = _contexto.get()
+    if atual is None:
+        _contexto.set({"nome": nome})
+    else:
+        atual["nome"] = nome
+
+
+def usuario_atual() -> str:
+    atual = _contexto.get()
+    return (atual or {}).get("nome") or USUARIO_SISTEMA
 
 
 def _fuso():
@@ -57,12 +99,10 @@ def registrar(
 
     partes = [
         f"{momento:%Y-%m-%d %H:%M:%S}",
+        sanitizar(usuario or usuario_atual(), 120) or USUARIO_SISTEMA,
         nivel,
         sanitizar(componente, 80) or "-",
     ]
-
-    if usuario:
-        partes.append(f"Usuário: {sanitizar(usuario, 120)}")
 
     if modelo:
         partes.append(f"Modelo: {sanitizar(modelo, 80)}")
